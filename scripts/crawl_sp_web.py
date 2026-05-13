@@ -53,6 +53,18 @@ MERCHANT_UUID_RE  = re.compile(
     r'"id"\s*:\s*"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"'
 )
 
+# Seletores do botão de "segurar" do Akamai — ajuste se necessário
+HOLD_BUTTON_SELECTORS = [
+    '[class*="hold"]',
+    '[class*="Hold"]',
+    '[class*="press"]',
+    '[class*="Press"]',
+    '[class*="challenge"]',
+    '[class*="Challenge"]',
+    '[data-testid*="hold"]',
+    'button[class*="verify"]',
+]
+
 EXCLUDED_URL_PARTS = [
     'customers/me', 'wallet', 'benefits', 'orders',
     'payment', 'profile', 'address', 'voucher', 'loyalty',
@@ -137,6 +149,78 @@ async def set_location_cookies(context, lat: float, lon: float):
             break
 
 
+def is_challenge_url(url: str) -> bool:
+    return any(x in url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite'])
+
+
+async def try_auto_hold(page) -> bool:
+    """
+    Tenta encontrar e segurar o botão do desafio Akamai automaticamente.
+    Retorna True se conseguiu interagir com algum botão.
+    """
+    for selector in HOLD_BUTTON_SELECTORS:
+        try:
+            btn = page.locator(selector).first
+            if not await btn.is_visible(timeout=1500):
+                continue
+            box = await btn.bounding_box()
+            if not box:
+                continue
+            cx = box['x'] + box['width']  / 2 + random.uniform(-3, 3)
+            cy = box['y'] + box['height'] / 2 + random.uniform(-3, 3)
+            await page.mouse.move(cx, cy, steps=random.randint(20, 35))
+            await asyncio.sleep(random.uniform(0.3, 0.7))
+            await page.mouse.down()
+            hold = random.uniform(4.5, 6.5)
+            # Micro-movimentos durante o hold para parecer humano
+            steps = int(hold / 0.3)
+            for _ in range(steps):
+                await page.mouse.move(
+                    cx + random.uniform(-2, 2),
+                    cy + random.uniform(-2, 2),
+                    steps=1,
+                )
+                await asyncio.sleep(0.3)
+            await page.mouse.up()
+            await asyncio.sleep(2.0)
+            print(f'[*] Desafio: hold simulado ({selector})')
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def handle_challenge(page, manual_timeout: int = 120) -> bool:
+    """
+    Detecta desafio, tenta automação e espera resolução manual como fallback.
+    Retorna True quando a página voltar ao estado normal.
+    """
+    if not is_challenge_url(page.url):
+        return True
+
+    print(f'\n[!] Desafio detectado: {page.url}')
+
+    # Tenta segurar o botão automaticamente
+    if await try_auto_hold(page):
+        await asyncio.sleep(2)
+        if not is_challenge_url(page.url):
+            print('[+] Desafio resolvido automaticamente.')
+            return True
+
+    # Fallback: aguarda resolução manual
+    print(f'[!] Automação falhou — resolva manualmente no browser ({manual_timeout}s)...')
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + manual_timeout
+    while loop.time() < deadline:
+        if not is_challenge_url(page.url):
+            print('[+] Desafio resolvido manualmente.')
+            return True
+        await asyncio.sleep(1)
+
+    print('[!] Timeout aguardando resolução do desafio.')
+    return False
+
+
 async def simulate_human(page):
     """Eventos de mouse/scroll para alimentar o sensor PX/Akamai."""
     await asyncio.sleep(random.uniform(1.5, 3.0))
@@ -196,6 +280,7 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
 
     try:
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
+        await handle_challenge(page)
         await simulate_human(page)
         await asyncio.wait_for(done.wait(), timeout=timeout)
     except asyncio.TimeoutError:
