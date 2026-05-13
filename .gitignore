@@ -1,0 +1,21 @@
+# Dados de captura e sessão
+captures/
+configs/session.json
+
+# APK e binários mobile
+apk/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Playwright
+playwright-report/
+test-results/
