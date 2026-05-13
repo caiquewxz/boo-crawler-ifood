@@ -54,6 +54,7 @@ async def main():
                 'Chrome/136.0.0.0 Safari/537.36'
             ),
             args=CHROME_ARGS,
+            ignore_default_args=['--enable-automation'],
         )
 
         page = await context.new_page()
