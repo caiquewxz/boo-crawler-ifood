@@ -306,19 +306,36 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         except Exception:
             pass
 
+    # Detecta o iframe do challenge assim que ele navega para wra-api —
+    # o Akamai injeta o iframe de forma assíncrona após o DOM carregar
+    challenge_flag = asyncio.Event()
+
+    def on_frame_navigated(frame):
+        if 'wra-api' in frame.url:
+            challenge_flag.set()
+
+    page.on('framenavigated', on_frame_navigated)
     page.on('response', handle_response)
     await page.route(API_ROUTE_PATTERN, handle_route)
 
     try:
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
-        await handle_challenge(page)
         await simulate_human(page)
-        await asyncio.wait_for(done.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
+
+        # Aguarda API ou challenge — o que vier primeiro
+        deadline = asyncio.get_event_loop().time() + timeout
+        while not done.is_set():
+            if asyncio.get_event_loop().time() > deadline:
+                break
+            if challenge_flag.is_set():
+                challenge_flag.clear()
+                await handle_challenge(page)
+            await asyncio.sleep(0.5)
+
     except Exception as e:
         resp_data.setdefault('error', str(e))
     finally:
+        page.remove_listener('framenavigated', on_frame_navigated)
         try:
             await page.unroute(API_ROUTE_PATTERN, handle_route)
         except Exception:
