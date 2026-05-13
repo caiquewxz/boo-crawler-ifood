@@ -54,13 +54,6 @@ CHROME_ARGS    = [
     '--no-default-browser-check',
 ]
 
-SITES = [
-    ('sannysoft',   'https://bot.sannysoft.com/'),
-    ('pixelscan',   'https://pixelscan.net/'),
-    ('browserscan', 'https://www.browserscan.net/bot-detection'),
-]
-
-
 async def main():
     ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = Path(__file__).parent.parent / 'captures' / f'fingerprint_{ts}'
@@ -84,22 +77,37 @@ async def main():
             ignore_default_args=['--enable-automation'],
         )
 
-        for name, url in SITES:
-            page = await context.new_page()
-            await page.add_init_script(STEALTH_SCRIPT)
-            if HAS_STEALTH:
-                await stealth_async(page)
+        # --- sannysoft: extrai resultados como texto ---
+        page = await context.new_page()
+        await page.add_init_script(STEALTH_SCRIPT)
+        if HAS_STEALTH:
+            await stealth_async(page)
 
-            print(f'[*] Abrindo {url} ...')
-            await page.goto(url, wait_until='networkidle', timeout=30000)
-            await page.wait_for_timeout(3000)  # aguarda renderização dos testes
+        print('[*] Abrindo bot.sannysoft.com ...')
+        await page.goto('https://bot.sannysoft.com/', wait_until='networkidle', timeout=30000)
+        await page.wait_for_timeout(3000)
 
-            path = out_dir / f'{name}.png'
-            await page.screenshot(path=str(path), full_page=True)
-            print(f'[+] Screenshot salvo: {path}')
+        await page.screenshot(path=str(out_dir / 'sannysoft.png'), full_page=True)
 
-        print(f'\n[*] Screenshots em: {out_dir}')
-        print('[*] Pressione ENTER para fechar o browser...')
+        # Extrai todas as linhas da tabela de resultados
+        rows = await page.evaluate("""() => {
+            const results = [];
+            document.querySelectorAll('table tr').forEach(tr => {
+                const cells = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
+                if (cells.length >= 2) results.push(cells.join(' | '));
+            });
+            return results;
+        }""")
+
+        print('\n=== SANNYSOFT RESULTS ===')
+        for row in rows:
+            print(row)
+
+        report_path = out_dir / 'sannysoft_results.txt'
+        report_path.write_text('\n'.join(rows), encoding='utf-8')
+        print(f'\n[+] Resultados salvos em: {report_path}')
+
+        print('\n[*] Pressione ENTER para fechar...')
         input()
         await context.close()
 
