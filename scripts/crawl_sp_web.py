@@ -227,9 +227,8 @@ async def main(step_km: float, delay: float, headless: bool):
         os='windows',
         humanize=True,
         locale=['pt-BR', 'pt'],
-        timezone='America/Sao_Paulo',
     ) as browser:
-        ctx_kwargs = {}
+        ctx_kwargs = {'timezone_id': 'America/Sao_Paulo'}
         if SESSION_FILE.exists():
             ctx_kwargs['storage_state'] = str(SESSION_FILE)
             print(f'[*] Sessao carregada de: {SESSION_FILE}')

@@ -21,9 +21,10 @@ async def main():
         os='windows',
         humanize=True,
         locale=['pt-BR', 'pt'],
-        timezone='America/Sao_Paulo',
     ) as browser:
-        context = await browser.new_context()
+        context = await browser.new_context(
+            timezone_id='America/Sao_Paulo',
+        )
         page    = await context.new_page()
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
 
