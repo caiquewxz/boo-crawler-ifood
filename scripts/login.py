@@ -1,5 +1,5 @@
 """
-Abre o iFood no Chrome real (via CDP) para login manual e salva a sessão.
+Abre o iFood no browser para login manual e salva a sessão.
 Execute uma vez antes de rodar o crawler.
 
 Uso:
@@ -8,66 +8,46 @@ Uso:
 
 import asyncio
 import json
-import subprocess
-import sys
-import time
 from pathlib import Path
-
 from playwright.async_api import async_playwright
+try:
+    from playwright_stealth import stealth_async
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
 
-CHROME_PATHS = [
-    Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-    Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-    Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
-]
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
+    Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en-US']});
+    window.chrome = { runtime: {} };
+"""
 
-CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
-SESSION_FILE   = Path(__file__).parent.parent / 'configs' / 'session.json'
-HOME_URL       = 'https://www.ifood.com.br/inicio'
-DEBUG_PORT     = 9222
-
-
-def find_chrome() -> str | None:
-    for p in CHROME_PATHS:
-        if p.exists():
-            return str(p)
-    return None
-
-
-async def connect_with_retry(playwright, port: int, retries: int = 10):
-    for _ in range(retries):
-        try:
-            return await playwright.chromium.connect_over_cdp(f'http://localhost:{port}')
-        except Exception:
-            await asyncio.sleep(0.5)
-    return None
+SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
+HOME_URL     = 'https://www.ifood.com.br/inicio'
 
 
 async def main():
-    chrome = find_chrome()
-    if not chrome:
-        print('[!] Chrome não encontrado. Instale o Google Chrome.')
-        sys.exit(1)
-
-    CHROME_PROFILE.mkdir(exist_ok=True)
-    proc = subprocess.Popen([
-        chrome,
-        f'--remote-debugging-port={DEBUG_PORT}',
-        f'--user-data-dir={CHROME_PROFILE}',
-        '--disable-blink-features=AutomationControlled',
-        '--no-first-run',
-        '--no-default-browser-check',
-        HOME_URL,
-    ])
-
     async with async_playwright() as p:
-        browser = await connect_with_retry(p, DEBUG_PORT)
-        if not browser:
-            print('[!] Não foi possível conectar ao Chrome.')
-            proc.terminate()
-            sys.exit(1)
-
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        browser = await p.chromium.launch(
+            headless=False,
+            channel='chrome',  # usa Chrome instalado, fingerprint mais legítimo
+            args=['--lang=pt-BR'],
+        )
+        context = await browser.new_context(
+            locale='pt-BR',
+            timezone_id='America/Sao_Paulo',
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/148.0.0.0 Safari/537.36'
+            ),
+        )
+        page = await context.new_page()
+        await page.add_init_script(STEALTH_SCRIPT)
+        if HAS_STEALTH:
+            await stealth_async(page)
+        await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
 
         print()
         print('=' * 60)
@@ -78,12 +58,10 @@ async def main():
         input()
 
         state = await context.storage_state()
-        SESSION_FILE.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8'
-        )
+        SESSION_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'[+] Sessão salva em: {SESSION_FILE}')
 
-    proc.terminate()
+        await browser.close()
 
 
 if __name__ == '__main__':

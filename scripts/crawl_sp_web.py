@@ -1,5 +1,5 @@
 """
-Crawler iFood Web — SP completo via Chrome real (CDP, sem flag de automação).
+Crawler iFood Web — SP completo via Playwright (navegação natural).
 
 Para cada ponto da grade:
   1. Atualiza cookies de localização (address-latitude, address-longitude, fstr.session)
@@ -9,10 +9,11 @@ Para cada ponto da grade:
   4. Captura o primeiro response com merchant UUIDs (sem exigir lat/lon na URL,
      pois /restaurantes pode usar os cookies como fonte de localização).
   5. Simula scroll + mouse para alimentar o sensor PX/Akamai.
+  6. Detecta desafio de "segurar botão" do Akamai e tenta resolvê-lo automaticamente.
 
 Uso:
     python scripts/login.py
-    python scripts/crawl_sp_web.py [--step 8.0] [--delay 60.0]
+    python scripts/crawl_sp_web.py [--step 8.0] [--delay 60.0] [--headless]
 
 Saída em captures/crawl_web_TIMESTAMP/:
     requests.jsonl  — um JSON por linha com request + response completos
@@ -25,35 +26,51 @@ import base64
 import json
 import random
 import re
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+try:
+    from playwright_stealth import stealth_async
+    HAS_STEALTH = True
+except ImportError:
+    HAS_STEALTH = False
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.sp_grid import generate_grid
 
-CHROME_PATHS = [
-    Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-    Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-    Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
-]
+# Stealth manual — cobre os sinais mais básicos sem precisar do pacote externo
+STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver',  {get: () => undefined});
+    Object.defineProperty(navigator, 'plugins',    {get: () => [1, 2, 3, 4, 5]});
+    Object.defineProperty(navigator, 'languages',  {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+    Object.defineProperty(navigator, 'deviceMemory',        {get: () => 8});
+    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+    Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+"""
 
-CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
-SESSION_FILE   = Path(__file__).parent.parent / 'configs' / 'session.json'
-DEBUG_PORT     = 9222
-
+# /restaurantes lista todos os estabelecimentos da região (sem curadoria)
 HOME_URL     = "https://www.ifood.com.br/restaurantes"
 IFOOD_HOST   = "www.ifood.com.br"
+SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
 
+# Intercepta qualquer chamada /site-api/ — sem fixar endpoint específico
 API_ROUTE_PATTERN = "**/site-api/**"
 MERCHANT_UUID_RE  = re.compile(
     r'"id"\s*:\s*"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"'
 )
 
-# Seletores do botão de "segurar" do Akamai — ajuste se necessário
+# Endpoints de conta/pagamento/benefícios — não são listagem de restaurantes
+EXCLUDED_URL_PARTS = [
+    'customers/me', 'wallet', 'benefits', 'orders',
+    'payment', 'profile', 'address', 'voucher', 'loyalty',
+    'fallback', 'cached', 'default',
+]
+
+# Seletores do botão de "segurar" do Akamai — ajuste com o seletor exato se necessário
 HOLD_BUTTON_SELECTORS = [
     '[class*="hold"]',
     '[class*="Hold"]',
@@ -65,24 +82,19 @@ HOLD_BUTTON_SELECTORS = [
     'button[class*="verify"]',
 ]
 
-EXCLUDED_URL_PARTS = [
-    'customers/me', 'wallet', 'benefits', 'orders',
-    'payment', 'profile', 'address', 'voucher', 'loyalty',
-    'fallback', 'cached', 'default',
-]
-
-
-def find_chrome() -> str | None:
-    for p in CHROME_PATHS:
-        if p.exists():
-            return str(p)
-    return None
-
 
 def is_restaurant_listing(url: str, body_text: str) -> bool:
+    """
+    True apenas para respostas que parecem listagem de restaurantes:
+    URL fora dos endpoints de conta/wallet e com >= 5 merchant UUIDs.
+    """
     if any(part in url.lower() for part in EXCLUDED_URL_PARTS):
         return False
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
+
+
+def is_challenge_url(url: str) -> bool:
+    return any(x in url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite'])
 
 
 def build_url(url: str, lat: float, lon: float) -> str:
@@ -103,15 +115,6 @@ def count_new_merchants(data, seen_ids: set) -> int:
     new = [mid for mid in ids if mid not in seen_ids]
     seen_ids.update(new)
     return len(new)
-
-
-async def connect_with_retry(playwright, port: int, retries: int = 10):
-    for _ in range(retries):
-        try:
-            return await playwright.chromium.connect_over_cdp(f'http://localhost:{port}')
-        except Exception:
-            await asyncio.sleep(0.5)
-    return None
 
 
 async def set_location_cookies(context, lat: float, lon: float):
@@ -149,10 +152,6 @@ async def set_location_cookies(context, lat: float, lon: float):
             break
 
 
-def is_challenge_url(url: str) -> bool:
-    return any(x in url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite'])
-
-
 async def try_auto_hold(page) -> bool:
     """
     Tenta encontrar e segurar o botão do desafio Akamai automaticamente.
@@ -172,7 +171,6 @@ async def try_auto_hold(page) -> bool:
             await asyncio.sleep(random.uniform(0.3, 0.7))
             await page.mouse.down()
             hold = random.uniform(4.5, 6.5)
-            # Micro-movimentos durante o hold para parecer humano
             steps = int(hold / 0.3)
             for _ in range(steps):
                 await page.mouse.move(
@@ -192,22 +190,21 @@ async def try_auto_hold(page) -> bool:
 
 async def handle_challenge(page, manual_timeout: int = 120) -> bool:
     """
-    Detecta desafio, tenta automação e espera resolução manual como fallback.
-    Retorna True quando a página voltar ao estado normal.
+    Detecta desafio de 'segurar botão', tenta automação e espera
+    resolução manual como fallback. Retorna True quando a página
+    voltar ao estado normal.
     """
     if not is_challenge_url(page.url):
         return True
 
     print(f'\n[!] Desafio detectado: {page.url}')
 
-    # Tenta segurar o botão automaticamente
     if await try_auto_hold(page):
         await asyncio.sleep(2)
         if not is_challenge_url(page.url):
             print('[+] Desafio resolvido automaticamente.')
             return True
 
-    # Fallback: aguarda resolução manual
     print(f'[!] Automação falhou — resolva manualmente no browser ({manual_timeout}s)...')
     loop = asyncio.get_event_loop()
     deadline = loop.time() + manual_timeout
@@ -222,26 +219,29 @@ async def handle_challenge(page, manual_timeout: int = 120) -> bool:
 
 
 async def simulate_human(page):
-    """Eventos de mouse/scroll para alimentar o sensor PX/Akamai."""
-    await asyncio.sleep(random.uniform(1.5, 3.0))
-    for _ in range(random.randint(2, 4)):
-        await page.mouse.move(
-            random.randint(200, 900), random.randint(100, 400),
-            steps=random.randint(15, 30),
-        )
-        await asyncio.sleep(random.uniform(0.3, 0.8))
-    await page.mouse.wheel(0, random.randint(300, 700))
+    """Eventos de mouse/scroll aleatórios para alimentar o sensor PX/Akamai."""
+    await asyncio.sleep(random.uniform(1.0, 2.5))
+    await page.mouse.move(
+        random.randint(200, 900), random.randint(100, 400),
+        steps=random.randint(10, 25),
+    )
+    await asyncio.sleep(random.uniform(0.4, 1.0))
+    await page.mouse.wheel(0, random.randint(200, 600))
     await asyncio.sleep(random.uniform(0.5, 1.2))
     await page.mouse.move(
         random.randint(100, 800), random.randint(200, 500),
-        steps=random.randint(8, 20),
+        steps=random.randint(6, 15),
     )
-    await asyncio.sleep(random.uniform(0.4, 1.0))
-    await page.mouse.wheel(0, random.randint(200, 500))
-    await asyncio.sleep(random.uniform(0.3, 0.7))
+    await asyncio.sleep(random.uniform(0.3, 0.8))
 
 
 async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
+    """
+    Navega para HOME_URL com cookies de localização já atualizados.
+    Intercepta qualquer /site-api/ com lat/lon na URL (substitui coordenadas).
+    Captura o primeiro response que retornar merchant UUIDs — não exige
+    lat/lon na URL, pois /restaurantes pode usar cookies como fonte.
+    """
     req_info  = {}
     resp_data = {}
     done      = asyncio.Event()
@@ -250,6 +250,7 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         url     = request.url
         new_url = build_url(url, lat, lon) if ('latitude=' in url or 'longitude=' in url) else url
 
+        # Captura metadados do primeiro request /site-api/
         if not req_info and 'site-api' in url:
             req_info['url']         = new_url
             req_info['method']      = request.method
@@ -301,9 +302,10 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
 
 async def ensure_session(page, context) -> bool:
     """
-    Navega para HOME_URL uma vez antes do crawl para verificar a sessão.
+    Navega para HOME_URL uma vez antes do crawl para que o browser
+    use o refresh token e atualize o JWT se estiver expirado.
     Salva a sessão renovada de volta no disco.
-    Retorna True se o cookie aAccessToken estiver presente.
+    Retorna True se o cookie aAccessToken estiver presente após a navegação.
     """
     print('[*] Verificando/renovando sessao...')
     try:
@@ -318,12 +320,7 @@ async def ensure_session(page, context) -> bool:
     return logged_in
 
 
-async def main(step_km: float, delay: float):
-    chrome = find_chrome()
-    if not chrome:
-        print('[!] Chrome não encontrado. Instale o Google Chrome.')
-        sys.exit(1)
-
+async def main(step_km: float, delay: float, headless: bool):
     points = generate_grid(step_km=step_km)
     print(f"[*] Grade {step_km} km: {len(points)} pontos")
 
@@ -333,45 +330,45 @@ async def main(step_km: float, delay: float):
     jsonl_path = out_dir / 'requests.jsonl'
     log_path   = out_dir / 'crawl.log'
 
-    seen_ids     = set()
-    total_new    = 0
-    detected_api = None
-
-    CHROME_PROFILE.mkdir(exist_ok=True)
-    proc = subprocess.Popen([
-        chrome,
-        f'--remote-debugging-port={DEBUG_PORT}',
-        f'--user-data-dir={CHROME_PROFILE}',
-        '--disable-blink-features=AutomationControlled',
-        '--no-first-run',
-        '--no-default-browser-check',
-    ])
+    seen_ids      = set()
+    total_new     = 0
+    detected_api  = None
 
     async with async_playwright() as p:
-        browser = await connect_with_retry(p, DEBUG_PORT)
-        if not browser:
-            print('[!] Não foi possível conectar ao Chrome.')
-            proc.terminate()
-            return
-
-        context = browser.contexts[0] if browser.contexts else await browser.new_context()
-
-        # Carrega cookies salvos pelo login.py caso o perfil esteja vazio
+        browser = await p.chromium.launch(
+            headless=headless,
+            channel='chrome',
+            args=['--lang=pt-BR'],
+        )
+        ctx_kwargs = dict(
+            locale='pt-BR',
+            timezone_id='America/Sao_Paulo',
+            user_agent=(
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/148.0.0.0 Safari/537.36'
+            ),
+        )
         if SESSION_FILE.exists():
-            state = json.loads(SESSION_FILE.read_text(encoding='utf-8'))
-            cookies = [c for c in state.get('cookies', []) if IFOOD_HOST in c.get('domain', '')]
-            if cookies:
-                await context.add_cookies(cookies)
-                print(f'[*] Cookies carregados de: {SESSION_FILE}')
+            ctx_kwargs['storage_state'] = str(SESSION_FILE)
+            print(f'[*] Sessao carregada de: {SESSION_FILE}')
         else:
-            print('[!] session.json não encontrado — execute login.py primeiro')
+            print(f'[!] session.json nao encontrado — execute login.py primeiro')
 
-        page = await context.new_page()
+        context = await browser.new_context(**ctx_kwargs)
+        page    = await context.new_page()
+
+        await page.add_init_script(STEALTH_SCRIPT)
+        if HAS_STEALTH:
+            await stealth_async(page)
+            print('[*] playwright-stealth aplicado')
+        else:
+            print('[*] Stealth manual aplicado (playwright-stealth nao instalado)')
 
         logged_in = await ensure_session(page, context)
         if not logged_in:
             print('[!] Sessao invalida ou expirada. Execute login.py e tente novamente.')
-            proc.terminate()
+            await browser.close()
             return
         print('[+] Sessao valida. Iniciando crawl.')
 
@@ -394,6 +391,7 @@ async def main(step_km: float, delay: float):
                     if 'error' in result:
                         raise Exception(result['error'])
 
+                    # Loga o endpoint detectado na primeira captura bem-sucedida
                     if detected_api is None and result.get('api_url'):
                         detected_api = result['api_url'].split('?')[0]
                         msg = f'[+] Endpoint detectado: {detected_api}'
@@ -407,7 +405,7 @@ async def main(step_km: float, delay: float):
                     jf.write(json.dumps(record, ensure_ascii=False) + '\n')
                     jf.flush()
 
-                    # Persiste tokens renovados pelo browser
+                    # Persiste tokens renovados pelo browser (evita expiração durante o crawl)
                     await context.storage_state(path=str(SESSION_FILE))
 
                     line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
@@ -431,12 +429,13 @@ async def main(step_km: float, delay: float):
         print(f'[+] Requests: {jsonl_path}')
         print(f'[+] Log:      {log_path}')
 
-    proc.terminate()
+        await browser.close()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Crawler iFood Web SP')
-    parser.add_argument('--step',  type=float, default=8.0,  help='Espaçamento da grade em km')
-    parser.add_argument('--delay', type=float, default=60.0, help='Delay base entre navegações (s)')
+    parser.add_argument('--step',     type=float, default=8.0,  help='Espaçamento da grade em km')
+    parser.add_argument('--delay',    type=float, default=60.0, help='Delay base entre navegações (s)')
+    parser.add_argument('--headless', action='store_true',       help='Rodar sem janela')
     args = parser.parse_args()
-    asyncio.run(main(args.step, args.delay))
+    asyncio.run(main(args.step, args.delay, args.headless))
