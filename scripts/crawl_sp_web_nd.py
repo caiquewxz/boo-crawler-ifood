@@ -2,8 +2,9 @@
 Crawler iFood Web — SP via nodriver (CDP nativo, sem WebDriver).
 
 nodriver controla o Chrome diretamente via CDP sem nenhum marcador de automação.
-Respostas da API capturadas via injeção de fetch/XHR no próprio JS da página,
-antes de qualquer script dela rodar — zero interception no nível de rede.
+Respostas da API capturadas via eventos CDP de rede (Network.ResponseReceived +
+Network.getResponseBody) — captura qualquer request (fetch, XHR, service worker)
+sem pausar ou modificar nada na rede.
 
 Uso:
     pip install nodriver
@@ -45,13 +46,11 @@ EXCLUDED_URL_PARTS = [
     'fallback', 'cached', 'default',
 ]
 
-# Injetado em todo novo documento antes de qualquer script da página.
-# Faz duas coisas:
-#   1. Patches de fingerprint (belt+suspenders sobre os do nodriver)
-#   2. Interceptor fetch/XHR — guarda respostas /site-api/ em window.__ifood_captured
-INIT_SCRIPT = r"""
+# Patches de fingerprint injetados antes de qualquer script da página.
+# Captura de respostas é feita via CDP Network events (não JS), então o
+# interceptor de fetch/XHR não é mais necessário aqui.
+STEALTH_SCRIPT = r"""
 (function() {
-    // --- fingerprint patches ---
     Object.defineProperty(Navigator.prototype, 'webdriver', {
         get: () => undefined, configurable: true, enumerable: true,
     });
@@ -87,44 +86,6 @@ INIT_SCRIPT = r"""
         loadTimes: function() {}, csi: function() {},
     };
     Object.defineProperty(Notification, 'permission', {get: () => 'default'});
-
-    // --- API response interceptor ---
-    window.__ifood_captured = [];
-
-    const _fetch = window.fetch;
-    window.fetch = async function(...args) {
-        const url = args[0] instanceof Request ? args[0].url : String(args[0]);
-        const res = await _fetch.apply(this, args);
-        if (url.includes('/site-api/')) {
-            try {
-                res.clone().json().then(d => {
-                    window.__ifood_captured.push({url, status: res.status, data: d});
-                }).catch(() => {});
-            } catch(e) {}
-        }
-        return res;
-    };
-
-    const _xhrOpen = XMLHttpRequest.prototype.open;
-    const _xhrSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function(m, url, ...r) {
-        this._cap_url = url;
-        return _xhrOpen.apply(this, [m, url, ...r]);
-    };
-    XMLHttpRequest.prototype.send = function(...a) {
-        if (this._cap_url && this._cap_url.includes('/site-api/')) {
-            this.addEventListener('load', () => {
-                try {
-                    window.__ifood_captured.push({
-                        url: this._cap_url,
-                        status: this.status,
-                        data: JSON.parse(this.responseText),
-                    });
-                } catch(e) {}
-            });
-        }
-        return _xhrSend.apply(this, a);
-    };
 })();
 """
 
@@ -309,30 +270,63 @@ async def natural_browse(tab):
 
 
 async def crawl_point(tab, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
-    # Ao navegar para HOME_URL o INIT_SCRIPT roda e reseta __ifood_captured = []
-    await tab.get(HOME_URL)
-    await simulate_human(tab)
+    captured = {}
+    done     = asyncio.Event()
+    pending  = {}   # request_id -> url
+    active   = True  # flag para desligar handlers após retorno
 
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        if await is_challenge_present(tab):
-            await handle_challenge(tab)
+    def on_request(event: cdp.network.RequestWillBeSent):
+        if active and 'site-api' in (event.request.url or ''):
+            pending[event.request_id] = event.request.url
 
-        raw = await tab.evaluate('JSON.stringify(window.__ifood_captured || [])')
-        if raw and raw not in ('[]', 'null', 'undefined'):
-            for item in json.loads(raw):
-                url_str   = item.get('url', '')
-                body_text = json.dumps(item.get('data', {}))
-                if is_restaurant_listing(url_str, body_text):
-                    return {
-                        'api_url':   url_str,
-                        'status':    item.get('status'),
-                        'resp_body': item.get('data'),
-                    }
+    async def on_response(event: cdp.network.ResponseReceived):
+        if not active or done.is_set():
+            return
+        url = pending.pop(event.request_id, None)
+        if not url or any(p in url.lower() for p in EXCLUDED_URL_PARTS):
+            return
+        try:
+            # Busca o body imediatamente — Chrome libera o buffer logo depois
+            result   = await tab.send(cdp.network.get_response_body(event.request_id))
+            body_str = result.body
+            if getattr(result, 'base64_encoded', False):
+                body_str = base64.b64decode(body_str).decode('utf-8')
+            body      = json.loads(body_str)
+            body_text = json.dumps(body)
+            if is_restaurant_listing(url, body_text):
+                captured['api_url']   = url
+                captured['status']    = event.response.status
+                captured['resp_body'] = body
+                done.set()
+        except Exception:
+            pass
 
-        await asyncio.sleep(0.5)
+    # Registra handlers antes de navegar para não perder respostas durante o load
+    tab.add_handler(cdp.network.RequestWillBeSent, on_request)
+    tab.add_handler(cdp.network.ResponseReceived,  on_response)
 
-    return None
+    try:
+        await tab.get(HOME_URL)
+        await simulate_human(tab)
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while not done.is_set() and asyncio.get_event_loop().time() < deadline:
+            if await is_challenge_present(tab):
+                await handle_challenge(tab)
+            await asyncio.sleep(0.5)
+    finally:
+        active = False
+        # Remove handlers desta chamada da lista interna do nodriver
+        for evt, fn in [
+            (cdp.network.RequestWillBeSent, on_request),
+            (cdp.network.ResponseReceived,  on_response),
+        ]:
+            try:
+                tab.handlers.get(evt, []).remove(fn)
+            except (ValueError, AttributeError):
+                pass
+
+    return captured if captured else None
 
 
 async def main(step_km: float, delay: float, headless: bool):
@@ -365,8 +359,8 @@ async def main(step_km: float, delay: float, headless: bool):
 
     tab = await browser.get('about:blank')
 
-    # Registra o INIT_SCRIPT para rodar em todo novo documento (persiste por toda a sessão)
-    await tab.send(cdp.page.add_script_to_evaluate_on_new_document(source=INIT_SCRIPT))
+    # Registra patches de stealth para rodar em todo novo documento
+    await tab.send(cdp.page.add_script_to_evaluate_on_new_document(source=STEALTH_SCRIPT))
     await tab.send(cdp.network.enable())
 
     # Verifica sessão
