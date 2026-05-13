@@ -92,14 +92,30 @@ async def find_hold_button(page):
     Procura o botão de hold em todos os frames da página (incluindo iframes).
     Retorna (locator, frame) ou (None, None).
     """
+    await asyncio.sleep(1.5)  # aguarda o challenge renderizar completamente
     for frame in page.frames:
         for selector in HOLD_BUTTON_SELECTORS:
             try:
                 btn = frame.locator(selector).first
-                if await btn.is_visible(timeout=600):
+                if await btn.is_visible(timeout=800):
+                    print(f'[*] Botão encontrado — frame: {frame.url[:70]}')
                     return btn, frame
             except Exception:
                 continue
+
+    # Diagnóstico: imprime frames e tenta achar o texto por evaluate
+    print(f'[DEBUG] {len(page.frames)} frame(s) encontrado(s):')
+    for i, frame in enumerate(page.frames):
+        try:
+            found = await frame.evaluate(
+                "() => document.body ? document.body.innerText : ''"
+            )
+            has_challenge = 'segure' in found.lower() or 'rob' in found.lower()
+            marker = ' <-- TEXTO DO CHALLENGE AQUI' if has_challenge else ''
+            print(f'[DEBUG]   [{i}] {frame.url[:70]}{marker}')
+        except Exception as e:
+            print(f'[DEBUG]   [{i}] {frame.url[:70]} (erro: {e})')
+
     return None, None
 
 
@@ -319,6 +335,7 @@ async def ensure_session(page, context) -> bool:
     print('[*] Verificando/renovando sessao...')
     try:
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
+        await handle_challenge(page)
         await asyncio.sleep(3)
     except Exception as e:
         print(f'[!] Erro ao carregar pagina de verificacao: {e}')
