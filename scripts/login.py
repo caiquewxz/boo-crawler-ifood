@@ -19,7 +19,11 @@ except ImportError:
 
 STEALTH_SCRIPT = """
 (function() {
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+        enumerable: true,
+    });
     Object.keys(window).filter(k => k.startsWith('cdc_')).forEach(k => {
         try { delete window[k]; } catch(e) {}
     });

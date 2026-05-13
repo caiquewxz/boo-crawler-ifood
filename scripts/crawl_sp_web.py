@@ -44,26 +44,43 @@ from configs.sp_grid import generate_grid
 # Remove sinais de automação injetados pelo Playwright/Chrome DevTools
 STEALTH_SCRIPT = """
 (function() {
-    // Remove webdriver
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+    // Patch no prototype — "New" tests checam Navigator.prototype, não a instância
+    Object.defineProperty(Navigator.prototype, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+        enumerable: true,
+    });
 
     // Remove marcadores cdc_ do Chrome DevTools Client
     Object.keys(window).filter(k => k.startsWith('cdc_')).forEach(k => {
         try { delete window[k]; } catch(e) {}
     });
 
-    // Plugins realistas
-    Object.defineProperty(navigator, 'plugins', {get: () => [
-        {name: 'PDF Viewer',               filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-        {name: 'Chrome PDF Viewer',        filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-        {name: 'Chromium PDF Viewer',      filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-        {name: 'Microsoft Edge PDF Viewer',filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-        {name: 'WebKit built-in PDF',      filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
-    ]});
+    // Plugins como PluginArray real (não Array simples)
+    const pluginData = [
+        {name: 'PDF Viewer',                filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Chrome PDF Viewer',         filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Chromium PDF Viewer',       filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+        {name: 'WebKit built-in PDF',       filename: 'internal-pdf-viewer', description: 'Portable Document Format'},
+    ];
+    try {
+        const fakePluginArray = Object.create(PluginArray.prototype);
+        pluginData.forEach((p, i) => {
+            const plugin = Object.create(Plugin.prototype);
+            Object.defineProperty(plugin, 'name',        {value: p.name,        enumerable: true});
+            Object.defineProperty(plugin, 'filename',    {value: p.filename,    enumerable: true});
+            Object.defineProperty(plugin, 'description', {value: p.description, enumerable: true});
+            Object.defineProperty(plugin, 'length',      {value: 0,             enumerable: true});
+            fakePluginArray[i] = plugin;
+        });
+        Object.defineProperty(fakePluginArray, 'length', {value: pluginData.length, enumerable: true});
+        Object.defineProperty(Navigator.prototype, 'plugins', {get: () => fakePluginArray, configurable: true});
+    } catch(e) {}
 
-    Object.defineProperty(navigator, 'languages',           {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
-    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-    Object.defineProperty(navigator, 'deviceMemory',        {get: () => 8});
+    Object.defineProperty(Navigator.prototype, 'languages',           {get: () => ['pt-BR', 'pt', 'en-US', 'en'], configurable: true});
+    Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {get: () => 8, configurable: true});
+    Object.defineProperty(Navigator.prototype, 'deviceMemory',        {get: () => 8, configurable: true});
 
     // Chrome runtime mock completo
     window.chrome = {
