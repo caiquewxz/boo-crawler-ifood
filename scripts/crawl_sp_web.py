@@ -89,32 +89,29 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
 
 async def find_hold_button(page):
     """
-    Procura o botão de hold em todos os frames da página (incluindo iframes).
+    Procura o botão de hold, priorizando o iframe do Akamai (wra-api.net).
+    Aguarda ativamente o conteúdo do iframe carregar antes de procurar.
     Retorna (locator, frame) ou (None, None).
     """
-    await asyncio.sleep(1.5)  # aguarda o challenge renderizar completamente
-    for frame in page.frames:
+    # Prioriza o iframe do Akamai — conteúdo carrega via JS, precisa de timeout maior
+    wra_frame = next(
+        (f for f in page.frames if 'wra-api' in f.url),
+        None,
+    )
+    targets = [(wra_frame, 8000)] if wra_frame else []
+    targets += [(f, 800) for f in page.frames if f is not wra_frame]
+
+    for frame, timeout in targets:
+        if frame is None:
+            continue
         for selector in HOLD_BUTTON_SELECTORS:
             try:
                 btn = frame.locator(selector).first
-                if await btn.is_visible(timeout=800):
+                if await btn.is_visible(timeout=timeout):
                     print(f'[*] Botão encontrado — frame: {frame.url[:70]}')
                     return btn, frame
             except Exception:
                 continue
-
-    # Diagnóstico: imprime frames e tenta achar o texto por evaluate
-    print(f'[DEBUG] {len(page.frames)} frame(s) encontrado(s):')
-    for i, frame in enumerate(page.frames):
-        try:
-            found = await frame.evaluate(
-                "() => document.body ? document.body.innerText : ''"
-            )
-            has_challenge = 'segure' in found.lower() or 'rob' in found.lower()
-            marker = ' <-- TEXTO DO CHALLENGE AQUI' if has_challenge else ''
-            print(f'[DEBUG]   [{i}] {frame.url[:70]}{marker}')
-        except Exception as e:
-            print(f'[DEBUG]   [{i}] {frame.url[:70]} (erro: {e})')
 
     return None, None
 
