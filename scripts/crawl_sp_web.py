@@ -1,5 +1,5 @@
 """
-Crawler iFood Web — SP completo via Playwright (navegação natural).
+Crawler iFood Web — SP completo via Camoufox (navegação natural).
 
 Para cada ponto da grade:
   1. Atualiza cookies de localização (address-latitude, address-longitude, fstr.session)
@@ -29,51 +29,28 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from playwright.async_api import async_playwright
-
-try:
-    from playwright_stealth import stealth_async
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
+from camoufox.async_api import AsyncCamoufox
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.sp_grid import generate_grid
 
-# Stealth manual — cobre os sinais mais básicos sem precisar do pacote externo
-STEALTH_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver',  {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins',    {get: () => [1, 2, 3, 4, 5]});
-    Object.defineProperty(navigator, 'languages',  {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
-    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
-    Object.defineProperty(navigator, 'deviceMemory',        {get: () => 8});
-    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
-    Object.defineProperty(Notification, 'permission', {get: () => 'default'});
-"""
-
-# /restaurantes lista todos os estabelecimentos da região (sem curadoria)
 HOME_URL     = "https://www.ifood.com.br/restaurantes"
 IFOOD_HOST   = "www.ifood.com.br"
 SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
 
-# Intercepta qualquer chamada /site-api/ — sem fixar endpoint específico
 API_ROUTE_PATTERN = "**/site-api/**"
 MERCHANT_UUID_RE  = re.compile(
     r'"id"\s*:\s*"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"'
 )
 
-# Endpoints de conta/pagamento/benefícios — não são listagem de restaurantes
 EXCLUDED_URL_PARTS = [
     'customers/me', 'wallet', 'benefits', 'orders',
     'payment', 'profile', 'address', 'voucher', 'loyalty',
     'fallback', 'cached', 'default',
 ]
 
+
 def is_restaurant_listing(url: str, body_text: str) -> bool:
-    """
-    True apenas para respostas que parecem listagem de restaurantes:
-    URL fora dos endpoints de conta/wallet e com >= 5 merchant UUIDs.
-    """
     if any(part in url.lower() for part in EXCLUDED_URL_PARTS):
         return False
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
@@ -135,29 +112,26 @@ async def set_location_cookies(context, lat: float, lon: float):
 
 
 async def simulate_human(page):
-    """Eventos de mouse/scroll aleatórios para alimentar o sensor PX/Akamai."""
-    await asyncio.sleep(random.uniform(1.0, 2.5))
-    await page.mouse.move(
-        random.randint(200, 900), random.randint(100, 400),
-        steps=random.randint(10, 25),
-    )
-    await asyncio.sleep(random.uniform(0.4, 1.0))
-    await page.mouse.wheel(0, random.randint(200, 600))
+    """Eventos de mouse/scroll para alimentar o sensor PX/Akamai."""
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+    for _ in range(random.randint(2, 4)):
+        await page.mouse.move(
+            random.randint(200, 900), random.randint(100, 400),
+            steps=random.randint(15, 30),
+        )
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+    await page.mouse.wheel(0, random.randint(300, 700))
     await asyncio.sleep(random.uniform(0.5, 1.2))
     await page.mouse.move(
         random.randint(100, 800), random.randint(200, 500),
-        steps=random.randint(6, 15),
+        steps=random.randint(8, 20),
     )
-    await asyncio.sleep(random.uniform(0.3, 0.8))
+    await asyncio.sleep(random.uniform(0.4, 1.0))
+    await page.mouse.wheel(0, random.randint(200, 500))
+    await asyncio.sleep(random.uniform(0.3, 0.7))
 
 
 async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
-    """
-    Navega para HOME_URL com cookies de localização já atualizados.
-    Intercepta qualquer /site-api/ com lat/lon na URL (substitui coordenadas).
-    Captura o primeiro response que retornar merchant UUIDs — não exige
-    lat/lon na URL, pois /restaurantes pode usar cookies como fonte.
-    """
     req_info  = {}
     resp_data = {}
     done      = asyncio.Event()
@@ -166,7 +140,6 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         url     = request.url
         new_url = build_url(url, lat, lon) if ('latitude=' in url or 'longitude=' in url) else url
 
-        # Captura metadados do primeiro request /site-api/
         if not req_info and 'site-api' in url:
             req_info['url']         = new_url
             req_info['method']      = request.method
@@ -245,45 +218,30 @@ async def main(step_km: float, delay: float, headless: bool):
     jsonl_path = out_dir / 'requests.jsonl'
     log_path   = out_dir / 'crawl.log'
 
-    seen_ids      = set()
-    total_new     = 0
-    detected_api  = None
+    seen_ids     = set()
+    total_new    = 0
+    detected_api = None
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=headless,
-            channel='chrome',
-            args=['--lang=pt-BR'],
-        )
-        ctx_kwargs = dict(
-            locale='pt-BR',
-            timezone_id='America/Sao_Paulo',
-            user_agent=(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/148.0.0.0 Safari/537.36'
-            ),
-        )
+    async with AsyncCamoufox(
+        headless=headless,
+        os='windows',
+        humanize=True,
+        locale=['pt-BR', 'pt'],
+        timezone='America/Sao_Paulo',
+    ) as browser:
+        ctx_kwargs = {}
         if SESSION_FILE.exists():
             ctx_kwargs['storage_state'] = str(SESSION_FILE)
             print(f'[*] Sessao carregada de: {SESSION_FILE}')
         else:
-            print(f'[!] session.json nao encontrado — execute login.py primeiro')
+            print('[!] session.json nao encontrado — execute login.py primeiro')
 
         context = await browser.new_context(**ctx_kwargs)
         page    = await context.new_page()
 
-        await page.add_init_script(STEALTH_SCRIPT)
-        if HAS_STEALTH:
-            await stealth_async(page)
-            print('[*] playwright-stealth aplicado')
-        else:
-            print('[*] Stealth manual aplicado (playwright-stealth nao instalado)')
-
         logged_in = await ensure_session(page, context)
         if not logged_in:
             print('[!] Sessao invalida ou expirada. Execute login.py e tente novamente.')
-            await browser.close()
             return
         print('[+] Sessao valida. Iniciando crawl.')
 
@@ -306,7 +264,6 @@ async def main(step_km: float, delay: float, headless: bool):
                     if 'error' in result:
                         raise Exception(result['error'])
 
-                    # Loga o endpoint detectado na primeira captura bem-sucedida
                     if detected_api is None and result.get('api_url'):
                         detected_api = result['api_url'].split('?')[0]
                         msg = f'[+] Endpoint detectado: {detected_api}'
@@ -343,8 +300,6 @@ async def main(step_km: float, delay: float, headless: bool):
         print(f'\n[+] Concluido. Merchants unicos: {total_new}')
         print(f'[+] Requests: {jsonl_path}')
         print(f'[+] Log:      {log_path}')
-
-        await browser.close()
 
 
 if __name__ == '__main__':

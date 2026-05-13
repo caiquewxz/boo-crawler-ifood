@@ -9,44 +9,22 @@ Uso:
 import asyncio
 import json
 from pathlib import Path
-from playwright.async_api import async_playwright
-try:
-    from playwright_stealth import stealth_async
-    HAS_STEALTH = True
-except ImportError:
-    HAS_STEALTH = False
-
-STEALTH_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en-US']});
-    window.chrome = { runtime: {} };
-"""
+from camoufox.async_api import AsyncCamoufox
 
 SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
 HOME_URL     = 'https://www.ifood.com.br/inicio'
 
 
 async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            channel='chrome',  # usa Chrome instalado, fingerprint mais legítimo
-            args=['--lang=pt-BR'],
-        )
-        context = await browser.new_context(
-            locale='pt-BR',
-            timezone_id='America/Sao_Paulo',
-            user_agent=(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/148.0.0.0 Safari/537.36'
-            ),
-        )
-        page = await context.new_page()
-        await page.add_init_script(STEALTH_SCRIPT)
-        if HAS_STEALTH:
-            await stealth_async(page)
+    async with AsyncCamoufox(
+        headless=False,
+        os='windows',
+        humanize=True,
+        locale=['pt-BR', 'pt'],
+        timezone='America/Sao_Paulo',
+    ) as browser:
+        context = await browser.new_context()
+        page    = await context.new_page()
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
 
         print()
@@ -60,8 +38,6 @@ async def main():
         state = await context.storage_state()
         SESSION_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'[+] Sessão salva em: {SESSION_FILE}')
-
-        await browser.close()
 
 
 if __name__ == '__main__':
