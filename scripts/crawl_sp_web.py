@@ -87,13 +87,27 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
 
 
+async def find_hold_button(page):
+    """
+    Procura o botão de hold em todos os frames da página (incluindo iframes).
+    Retorna (locator, frame) ou (None, None).
+    """
+    for frame in page.frames:
+        for selector in HOLD_BUTTON_SELECTORS:
+            try:
+                btn = frame.locator(selector).first
+                if await btn.is_visible(timeout=600):
+                    return btn, frame
+            except Exception:
+                continue
+    return None, None
+
+
 async def is_challenge_present(page) -> bool:
     if any(x in page.url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
         return True
-    try:
-        return await page.locator('p:has-text("Pressione e segure")').is_visible(timeout=1500)
-    except Exception:
-        return False
+    btn, _ = await find_hold_button(page)
+    return btn is not None
 
 
 def build_url(url: str, lat: float, lon: float) -> str:
@@ -153,38 +167,35 @@ async def set_location_cookies(context, lat: float, lon: float):
 
 async def try_auto_hold(page) -> bool:
     """
-    Tenta encontrar e segurar o botão do desafio Akamai automaticamente.
-    Retorna True se conseguiu interagir com algum botão.
+    Encontra o botão em qualquer frame (incluindo iframes) e simula o hold.
+    bounding_box() retorna coordenadas relativas ao viewport, então page.mouse funciona direto.
     """
-    for selector in HOLD_BUTTON_SELECTORS:
-        try:
-            btn = page.locator(selector).first
-            if not await btn.is_visible(timeout=1500):
-                continue
-            box = await btn.bounding_box()
-            if not box:
-                continue
-            cx = box['x'] + box['width']  / 2 + random.uniform(-3, 3)
-            cy = box['y'] + box['height'] / 2 + random.uniform(-3, 3)
-            await page.mouse.move(cx, cy, steps=random.randint(20, 35))
-            await asyncio.sleep(random.uniform(0.3, 0.7))
-            await page.mouse.down()
-            hold = random.uniform(4.5, 6.5)
-            steps = int(hold / 0.3)
-            for _ in range(steps):
-                await page.mouse.move(
-                    cx + random.uniform(-2, 2),
-                    cy + random.uniform(-2, 2),
-                    steps=1,
-                )
-                await asyncio.sleep(0.3)
-            await page.mouse.up()
-            await asyncio.sleep(2.0)
-            print(f'[*] Desafio: hold simulado ({selector})')
-            return True
-        except Exception:
-            continue
-    return False
+    btn, _ = await find_hold_button(page)
+    if btn is None:
+        return False
+
+    box = await btn.bounding_box()
+    if not box:
+        return False
+
+    cx = box['x'] + box['width']  / 2 + random.uniform(-3, 3)
+    cy = box['y'] + box['height'] / 2 + random.uniform(-3, 3)
+    await page.mouse.move(cx, cy, steps=random.randint(20, 35))
+    await asyncio.sleep(random.uniform(0.3, 0.7))
+    await page.mouse.down()
+    hold  = random.uniform(4.5, 6.5)
+    steps = int(hold / 0.3)
+    for _ in range(steps):
+        await page.mouse.move(
+            cx + random.uniform(-2, 2),
+            cy + random.uniform(-2, 2),
+            steps=1,
+        )
+        await asyncio.sleep(0.3)
+    await page.mouse.up()
+    await asyncio.sleep(2.0)
+    print('[*] Desafio: hold simulado')
+    return True
 
 
 async def handle_challenge(page, manual_timeout: int = 120) -> bool:
