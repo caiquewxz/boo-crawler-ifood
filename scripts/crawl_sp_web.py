@@ -70,11 +70,7 @@ EXCLUDED_URL_PARTS = [
     'fallback', 'cached', 'default',
 ]
 
-# Seletor do botão de "segurar" do Akamai no iFood
-HOLD_BUTTON_SELECTORS = [
-    'p:has-text("Pressione e segure")',
-    'p:has-text("Press and hold")',
-]
+CHALLENGE_IFRAME_SELECTOR = 'iframe[src*="wra-api"]'
 
 
 def is_restaurant_listing(url: str, body_text: str) -> bool:
@@ -87,40 +83,13 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
 
 
-async def find_hold_button(page):
-    """
-    Procura o botão de hold, priorizando o iframe do Akamai (wra-api.net).
-    Aguarda ativamente o conteúdo do iframe carregar antes de procurar.
-    Retorna (locator, frame) ou (None, None).
-    """
-    # Prioriza o iframe do Akamai — conteúdo carrega via JS, precisa de timeout maior
-    wra_frame = next(
-        (f for f in page.frames if 'wra-api' in f.url),
-        None,
-    )
-    targets = [(wra_frame, 8000)] if wra_frame else []
-    targets += [(f, 800) for f in page.frames if f is not wra_frame]
-
-    for frame, timeout in targets:
-        if frame is None:
-            continue
-        for selector in HOLD_BUTTON_SELECTORS:
-            try:
-                btn = frame.locator(selector).first
-                if await btn.is_visible(timeout=timeout):
-                    print(f'[*] Botão encontrado — frame: {frame.url[:70]}')
-                    return btn, frame
-            except Exception:
-                continue
-
-    return None, None
-
-
 async def is_challenge_present(page) -> bool:
     if any(x in page.url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
         return True
-    btn, _ = await find_hold_button(page)
-    return btn is not None
+    try:
+        return await page.locator(CHALLENGE_IFRAME_SELECTOR).is_visible(timeout=2000)
+    except Exception:
+        return False
 
 
 def build_url(url: str, lat: float, lon: float) -> str:
@@ -180,34 +149,39 @@ async def set_location_cookies(context, lat: float, lon: float):
 
 async def try_auto_hold(page) -> bool:
     """
-    Encontra o botão em qualquer frame (incluindo iframes) e simula o hold.
-    bounding_box() retorna coordenadas relativas ao viewport, então page.mouse funciona direto.
+    Pega o bounding box do <iframe> wra-api na página principal e faz
+    mouse.down() no centro dele — sem precisar entrar no frame.
     """
-    btn, _ = await find_hold_button(page)
-    if btn is None:
+    iframe_el = page.locator(CHALLENGE_IFRAME_SELECTOR).first
+    try:
+        await iframe_el.wait_for(state='visible', timeout=5000)
+    except Exception:
         return False
 
-    box = await btn.bounding_box()
+    box = await iframe_el.bounding_box()
     if not box:
         return False
 
-    cx = box['x'] + box['width']  / 2 + random.uniform(-3, 3)
-    cy = box['y'] + box['height'] / 2 + random.uniform(-3, 3)
+    cx = box['x'] + box['width']  / 2
+    cy = box['y'] + box['height'] / 2
+
     await page.mouse.move(cx, cy, steps=random.randint(20, 35))
-    await asyncio.sleep(random.uniform(0.3, 0.7))
+    await asyncio.sleep(random.uniform(0.4, 0.8))
     await page.mouse.down()
-    hold  = random.uniform(4.5, 6.5)
-    steps = int(hold / 0.3)
-    for _ in range(steps):
+
+    hold  = random.uniform(5.0, 7.0)
+    ticks = int(hold / 0.25)
+    for _ in range(ticks):
         await page.mouse.move(
             cx + random.uniform(-2, 2),
             cy + random.uniform(-2, 2),
             steps=1,
         )
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.25)
+
     await page.mouse.up()
     await asyncio.sleep(2.0)
-    print('[*] Desafio: hold simulado')
+    print('[*] Desafio: hold simulado no iframe wra-api')
     return True
 
 
