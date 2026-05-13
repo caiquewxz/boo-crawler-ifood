@@ -106,7 +106,6 @@ CHROME_ARGS       = [
     '--no-default-browser-check',
 ]
 
-API_ROUTE_PATTERN    = "**/site-api/**"
 CHALLENGE_IFRAME_SEL = 'iframe[src*="wra-api"]'
 MERCHANT_UUID_RE     = re.compile(
     r'"id"\s*:\s*"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"'
@@ -124,12 +123,6 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
         return False
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
 
-
-def build_url(url: str, lat: float, lon: float) -> str:
-    url = re.sub(r'latitude=[^&]+',  f'latitude={lat}',  url)
-    url = re.sub(r'longitude=[^&]+', f'longitude={lon}', url)
-    url = re.sub(r'size=\d+',        'size=100',          url)
-    return url
 
 
 def count_new_merchants(data, seen_ids: set) -> int:
@@ -328,20 +321,14 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
     resp_data = {}
     done      = asyncio.Event()
 
-    async def handle_route(route, request):
-        url     = request.url
-        new_url = build_url(url, lat, lon) if ('latitude=' in url or 'longitude=' in url) else url
-
-        if not req_info and 'site-api' in url:
-            req_info['url']         = new_url
+    # page.on('request') apenas observa — não pausa nem modifica nada,
+    # evitando a latência artificial que page.route() introduz em cada request
+    def handle_request(request):
+        if not req_info and 'site-api' in request.url:
+            req_info['url']         = request.url
             req_info['method']      = request.method
             req_info['req_headers'] = dict(request.headers)
             req_info['req_body']    = request.post_data
-
-        if new_url != url:
-            await route.continue_(url=new_url)
-        else:
-            await route.continue_()
 
     async def handle_response(response):
         if 'site-api' not in response.url or done.is_set():
@@ -357,8 +344,6 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         except Exception:
             pass
 
-    # Detecta o iframe do challenge assim que ele navega para wra-api —
-    # o Akamai injeta o iframe de forma assíncrona após o DOM carregar
     challenge_flag = asyncio.Event()
 
     def on_frame_navigated(frame):
@@ -366,14 +351,15 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
             challenge_flag.set()
 
     page.on('framenavigated', on_frame_navigated)
+    page.on('request', handle_request)
     page.on('response', handle_response)
-    await page.route(API_ROUTE_PATTERN, handle_route)
 
     try:
-        await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
+        # Referer de /inicio simula navegação interna (usuário clicou em "Restaurantes")
+        await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000,
+                        referer=INICIO_URL)
         await simulate_human(page)
 
-        # Aguarda API ou challenge — o que vier primeiro
         deadline = asyncio.get_event_loop().time() + timeout
         while not done.is_set():
             if asyncio.get_event_loop().time() > deadline:
@@ -387,10 +373,7 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         resp_data.setdefault('error', str(e))
     finally:
         page.remove_listener('framenavigated', on_frame_navigated)
-        try:
-            await page.unroute(API_ROUTE_PATTERN, handle_route)
-        except Exception:
-            pass
+        page.remove_listener('request', handle_request)
         page.remove_listener('response', handle_response)
 
     if not resp_data:
