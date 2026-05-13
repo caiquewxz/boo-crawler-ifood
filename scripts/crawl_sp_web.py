@@ -95,6 +95,7 @@ STEALTH_SCRIPT = """
 """
 
 HOME_URL          = "https://www.ifood.com.br/restaurantes"
+INICIO_URL        = "https://www.ifood.com.br/inicio"
 IFOOD_HOST        = "www.ifood.com.br"
 SESSION_FILE      = Path(__file__).parent.parent / 'configs' / 'session.json'
 CHROME_PROFILE    = Path(__file__).parent.parent / '.chrome-profile'
@@ -272,6 +273,56 @@ async def simulate_human(page):
     await asyncio.sleep(random.uniform(0.3, 0.8))
 
 
+async def natural_browse(page):
+    """
+    Navega pelo iFood como um usuário real antes do crawl.
+    Vai à home, rola a página, interage com cards e sai — para que o
+    sensor comportamental do Akamai acumule sinais legítimos.
+    """
+    try:
+        await page.goto(INICIO_URL, wait_until='domcontentloaded', timeout=30000)
+    except Exception:
+        return
+
+    # Trata desafio imediato (redirect para /entrar etc.)
+    if await is_challenge_present(page):
+        await handle_challenge(page)
+
+    await asyncio.sleep(random.uniform(2.0, 4.0))
+
+    # Scroll gradual como quem está lendo a página
+    scroll_steps = random.randint(3, 6)
+    for _ in range(scroll_steps):
+        await page.mouse.move(
+            random.randint(150, 1000),
+            random.randint(100, 600),
+            steps=random.randint(8, 18),
+        )
+        await page.mouse.wheel(0, random.randint(200, 500))
+        await asyncio.sleep(random.uniform(0.8, 2.2))
+
+    # Hover em algum card de restaurante com probabilidade 60%
+    if random.random() < 0.6:
+        try:
+            cards = page.locator('[class*="merchant-list"], [class*="card"], [class*="restaurant"]')
+            count = await cards.count()
+            if count > 0:
+                card = cards.nth(random.randint(0, min(count - 1, 4)))
+                await card.hover(timeout=2000)
+                await asyncio.sleep(random.uniform(0.6, 1.8))
+        except Exception:
+            pass
+
+    # Às vezes sobe um pouco a página (comportamento natural)
+    if random.random() < 0.4:
+        await page.mouse.wheel(0, -random.randint(150, 350))
+        await asyncio.sleep(random.uniform(0.5, 1.2))
+
+    # Pausa final antes do crawl
+    await asyncio.sleep(random.uniform(1.5, 3.0))
+    print('[*] Navegacao natural concluida')
+
+
 async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
     req_info  = {}
     resp_data = {}
@@ -423,6 +474,7 @@ async def main(step_km: float, delay: float, headless: bool):
             for i, (lat, lon) in enumerate(points, 1):
                 try:
                     await set_location_cookies(context, lat, lon)
+                    await natural_browse(page)
                     result = await crawl_point(page, lat, lon)
 
                     if result is None:
