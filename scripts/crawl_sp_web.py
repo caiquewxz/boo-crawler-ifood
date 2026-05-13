@@ -70,16 +70,10 @@ EXCLUDED_URL_PARTS = [
     'fallback', 'cached', 'default',
 ]
 
-# Seletores do botão de "segurar" do Akamai — ajuste com o seletor exato se necessário
+# Seletor do botão de "segurar" do Akamai no iFood
 HOLD_BUTTON_SELECTORS = [
-    '[class*="hold"]',
-    '[class*="Hold"]',
-    '[class*="press"]',
-    '[class*="Press"]',
-    '[class*="challenge"]',
-    '[class*="Challenge"]',
-    '[data-testid*="hold"]',
-    'button[class*="verify"]',
+    'p:has-text("Pressione e segure")',
+    'p:has-text("Press and hold")',
 ]
 
 
@@ -93,8 +87,13 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
 
 
-def is_challenge_url(url: str) -> bool:
-    return any(x in url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite'])
+async def is_challenge_present(page) -> bool:
+    if any(x in page.url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
+        return True
+    try:
+        return await page.locator('p:has-text("Pressione e segure")').is_visible(timeout=1500)
+    except Exception:
+        return False
 
 
 def build_url(url: str, lat: float, lon: float) -> str:
@@ -190,18 +189,17 @@ async def try_auto_hold(page) -> bool:
 
 async def handle_challenge(page, manual_timeout: int = 120) -> bool:
     """
-    Detecta desafio de 'segurar botão', tenta automação e espera
-    resolução manual como fallback. Retorna True quando a página
-    voltar ao estado normal.
+    Detecta desafio de 'segurar botão' (overlay ou redirect), tenta automação
+    e espera resolução manual como fallback. Retorna True quando resolvido.
     """
-    if not is_challenge_url(page.url):
+    if not await is_challenge_present(page):
         return True
 
     print(f'\n[!] Desafio detectado: {page.url}')
 
     if await try_auto_hold(page):
         await asyncio.sleep(2)
-        if not is_challenge_url(page.url):
+        if not await is_challenge_present(page):
             print('[+] Desafio resolvido automaticamente.')
             return True
 
@@ -209,7 +207,7 @@ async def handle_challenge(page, manual_timeout: int = 120) -> bool:
     loop = asyncio.get_event_loop()
     deadline = loop.time() + manual_timeout
     while loop.time() < deadline:
-        if not is_challenge_url(page.url):
+        if not await is_challenge_present(page):
             print('[+] Desafio resolvido manualmente.')
             return True
         await asyncio.sleep(1)
