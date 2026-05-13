@@ -1,5 +1,5 @@
 """
-Crawler iFood Web — SP completo via Camoufox (navegação natural).
+Crawler iFood Web — SP completo via Chrome real (CDP, sem flag de automação).
 
 Para cada ponto da grade:
   1. Atualiza cookies de localização (address-latitude, address-longitude, fstr.session)
@@ -12,7 +12,7 @@ Para cada ponto da grade:
 
 Uso:
     python scripts/login.py
-    python scripts/crawl_sp_web.py [--step 8.0] [--delay 60.0] [--headless]
+    python scripts/crawl_sp_web.py [--step 8.0] [--delay 60.0]
 
 Saída em captures/crawl_web_TIMESTAMP/:
     requests.jsonl  — um JSON por linha com request + response completos
@@ -25,18 +25,28 @@ import base64
 import json
 import random
 import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from camoufox.async_api import AsyncCamoufox
+from playwright.async_api import async_playwright
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.sp_grid import generate_grid
 
+CHROME_PATHS = [
+    Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+    Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+    Path.home() / r"AppData\Local\Google\Chrome\Application\chrome.exe",
+]
+
+CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
+SESSION_FILE   = Path(__file__).parent.parent / 'configs' / 'session.json'
+DEBUG_PORT     = 9222
+
 HOME_URL     = "https://www.ifood.com.br/restaurantes"
 IFOOD_HOST   = "www.ifood.com.br"
-SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
 
 API_ROUTE_PATTERN = "**/site-api/**"
 MERCHANT_UUID_RE  = re.compile(
@@ -48,6 +58,13 @@ EXCLUDED_URL_PARTS = [
     'payment', 'profile', 'address', 'voucher', 'loyalty',
     'fallback', 'cached', 'default',
 ]
+
+
+def find_chrome() -> str | None:
+    for p in CHROME_PATHS:
+        if p.exists():
+            return str(p)
+    return None
 
 
 def is_restaurant_listing(url: str, body_text: str) -> bool:
@@ -74,6 +91,15 @@ def count_new_merchants(data, seen_ids: set) -> int:
     new = [mid for mid in ids if mid not in seen_ids]
     seen_ids.update(new)
     return len(new)
+
+
+async def connect_with_retry(playwright, port: int, retries: int = 10):
+    for _ in range(retries):
+        try:
+            return await playwright.chromium.connect_over_cdp(f'http://localhost:{port}')
+        except Exception:
+            await asyncio.sleep(0.5)
+    return None
 
 
 async def set_location_cookies(context, lat: float, lon: float):
@@ -190,10 +216,9 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
 
 async def ensure_session(page, context) -> bool:
     """
-    Navega para HOME_URL uma vez antes do crawl para que o browser
-    use o refresh token e atualize o JWT se estiver expirado.
+    Navega para HOME_URL uma vez antes do crawl para verificar a sessão.
     Salva a sessão renovada de volta no disco.
-    Retorna True se o cookie aAccessToken estiver presente após a navegação.
+    Retorna True se o cookie aAccessToken estiver presente.
     """
     print('[*] Verificando/renovando sessao...')
     try:
@@ -208,7 +233,12 @@ async def ensure_session(page, context) -> bool:
     return logged_in
 
 
-async def main(step_km: float, delay: float, headless: bool):
+async def main(step_km: float, delay: float):
+    chrome = find_chrome()
+    if not chrome:
+        print('[!] Chrome não encontrado. Instale o Google Chrome.')
+        sys.exit(1)
+
     points = generate_grid(step_km=step_km)
     print(f"[*] Grade {step_km} km: {len(points)} pontos")
 
@@ -222,25 +252,41 @@ async def main(step_km: float, delay: float, headless: bool):
     total_new    = 0
     detected_api = None
 
-    async with AsyncCamoufox(
-        headless=headless,
-        os='windows',
-        humanize=True,
-        locale=['pt-BR', 'pt'],
-    ) as browser:
-        ctx_kwargs = {'timezone_id': 'America/Sao_Paulo'}
-        if SESSION_FILE.exists():
-            ctx_kwargs['storage_state'] = str(SESSION_FILE)
-            print(f'[*] Sessao carregada de: {SESSION_FILE}')
-        else:
-            print('[!] session.json nao encontrado — execute login.py primeiro')
+    CHROME_PROFILE.mkdir(exist_ok=True)
+    proc = subprocess.Popen([
+        chrome,
+        f'--remote-debugging-port={DEBUG_PORT}',
+        f'--user-data-dir={CHROME_PROFILE}',
+        '--disable-blink-features=AutomationControlled',
+        '--no-first-run',
+        '--no-default-browser-check',
+    ])
 
-        context = await browser.new_context(**ctx_kwargs)
-        page    = await context.new_page()
+    async with async_playwright() as p:
+        browser = await connect_with_retry(p, DEBUG_PORT)
+        if not browser:
+            print('[!] Não foi possível conectar ao Chrome.')
+            proc.terminate()
+            return
+
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+
+        # Carrega cookies salvos pelo login.py caso o perfil esteja vazio
+        if SESSION_FILE.exists():
+            state = json.loads(SESSION_FILE.read_text(encoding='utf-8'))
+            cookies = [c for c in state.get('cookies', []) if IFOOD_HOST in c.get('domain', '')]
+            if cookies:
+                await context.add_cookies(cookies)
+                print(f'[*] Cookies carregados de: {SESSION_FILE}')
+        else:
+            print('[!] session.json não encontrado — execute login.py primeiro')
+
+        page = await context.new_page()
 
         logged_in = await ensure_session(page, context)
         if not logged_in:
             print('[!] Sessao invalida ou expirada. Execute login.py e tente novamente.')
+            proc.terminate()
             return
         print('[+] Sessao valida. Iniciando crawl.')
 
@@ -276,7 +322,7 @@ async def main(step_km: float, delay: float, headless: bool):
                     jf.write(json.dumps(record, ensure_ascii=False) + '\n')
                     jf.flush()
 
-                    # Persiste tokens renovados pelo browser (evita expiração durante o crawl)
+                    # Persiste tokens renovados pelo browser
                     await context.storage_state(path=str(SESSION_FILE))
 
                     line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
@@ -300,11 +346,12 @@ async def main(step_km: float, delay: float, headless: bool):
         print(f'[+] Requests: {jsonl_path}')
         print(f'[+] Log:      {log_path}')
 
+    proc.terminate()
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Crawler iFood Web SP')
-    parser.add_argument('--step',     type=float, default=8.0,  help='Espaçamento da grade em km')
-    parser.add_argument('--delay',    type=float, default=60.0, help='Delay base entre navegações (s)')
-    parser.add_argument('--headless', action='store_true',       help='Rodar sem janela')
+    parser.add_argument('--step',  type=float, default=8.0,  help='Espaçamento da grade em km')
+    parser.add_argument('--delay', type=float, default=60.0, help='Delay base entre navegações (s)')
     args = parser.parse_args()
-    asyncio.run(main(args.step, args.delay, args.headless))
+    asyncio.run(main(args.step, args.delay))

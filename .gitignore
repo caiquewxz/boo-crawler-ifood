@@ -2,6 +2,9 @@
 captures/
 configs/session.json
 
+# Perfil do Chrome usado pelo crawler
+.chrome-profile/
+
 # APK e binários mobile
 apk/
 
