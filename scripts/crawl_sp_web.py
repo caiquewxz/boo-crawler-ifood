@@ -41,55 +41,70 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.sp_grid import generate_grid
 
-# Stealth manual — cobre os sinais mais básicos sem precisar do pacote externo
+# Remove sinais de automação injetados pelo Playwright/Chrome DevTools
 STEALTH_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver',  {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins',    {get: () => [1, 2, 3, 4, 5]});
-    Object.defineProperty(navigator, 'languages',  {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
+(function() {
+    // Remove webdriver
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+    // Remove marcadores cdc_ do Chrome DevTools Client
+    Object.keys(window).filter(k => k.startsWith('cdc_')).forEach(k => {
+        try { delete window[k]; } catch(e) {}
+    });
+
+    // Plugins realistas
+    Object.defineProperty(navigator, 'plugins', {get: () => [
+        {name: 'PDF Viewer',               filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+        {name: 'Chrome PDF Viewer',        filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+        {name: 'Chromium PDF Viewer',      filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+        {name: 'Microsoft Edge PDF Viewer',filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+        {name: 'WebKit built-in PDF',      filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1},
+    ]});
+
+    Object.defineProperty(navigator, 'languages',           {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
     Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
     Object.defineProperty(navigator, 'deviceMemory',        {get: () => 8});
-    window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}, app: {}};
+
+    // Chrome runtime mock completo
+    window.chrome = {
+        app: {isInstalled: false},
+        runtime: {connect: () => {}, sendMessage: () => {}},
+        loadTimes: function() {},
+        csi: function() {},
+    };
+
     Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+})();
 """
 
-# /restaurantes lista todos os estabelecimentos da região (sem curadoria)
-HOME_URL     = "https://www.ifood.com.br/restaurantes"
-IFOOD_HOST   = "www.ifood.com.br"
-SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
+HOME_URL          = "https://www.ifood.com.br/restaurantes"
+IFOOD_HOST        = "www.ifood.com.br"
+SESSION_FILE      = Path(__file__).parent.parent / 'configs' / 'session.json'
+CHROME_PROFILE    = Path(__file__).parent.parent / '.chrome-profile'
+CHROME_ARGS       = [
+    '--lang=pt-BR',
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+    '--no-default-browser-check',
+]
 
-# Intercepta qualquer chamada /site-api/ — sem fixar endpoint específico
-API_ROUTE_PATTERN = "**/site-api/**"
-MERCHANT_UUID_RE  = re.compile(
+API_ROUTE_PATTERN    = "**/site-api/**"
+CHALLENGE_IFRAME_SEL = 'iframe[src*="wra-api"]'
+MERCHANT_UUID_RE     = re.compile(
     r'"id"\s*:\s*"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"'
 )
 
-# Endpoints de conta/pagamento/benefícios — não são listagem de restaurantes
 EXCLUDED_URL_PARTS = [
     'customers/me', 'wallet', 'benefits', 'orders',
     'payment', 'profile', 'address', 'voucher', 'loyalty',
     'fallback', 'cached', 'default',
 ]
 
-CHALLENGE_IFRAME_SELECTOR = 'iframe[src*="wra-api"]'
-
 
 def is_restaurant_listing(url: str, body_text: str) -> bool:
-    """
-    True apenas para respostas que parecem listagem de restaurantes:
-    URL fora dos endpoints de conta/wallet e com >= 5 merchant UUIDs.
-    """
     if any(part in url.lower() for part in EXCLUDED_URL_PARTS):
         return False
     return len(MERCHANT_UUID_RE.findall(body_text)) >= 5
-
-
-async def is_challenge_present(page) -> bool:
-    if any(x in page.url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
-        return True
-    try:
-        return await page.locator(CHALLENGE_IFRAME_SELECTOR).is_visible(timeout=2000)
-    except Exception:
-        return False
 
 
 def build_url(url: str, lat: float, lon: float) -> str:
@@ -147,12 +162,21 @@ async def set_location_cookies(context, lat: float, lon: float):
             break
 
 
+async def is_challenge_present(page) -> bool:
+    if any(x in page.url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
+        return True
+    try:
+        return await page.locator(CHALLENGE_IFRAME_SEL).is_visible(timeout=2000)
+    except Exception:
+        return False
+
+
 async def try_auto_hold(page) -> bool:
     """
     Pega o bounding box do <iframe> wra-api na página principal e faz
     mouse.down() no centro dele — sem precisar entrar no frame.
     """
-    iframe_el = page.locator(CHALLENGE_IFRAME_SELECTOR).first
+    iframe_el = page.locator(CHALLENGE_IFRAME_SEL).first
     try:
         await iframe_el.wait_for(state='visible', timeout=5000)
     except Exception:
@@ -232,12 +256,6 @@ async def simulate_human(page):
 
 
 async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
-    """
-    Navega para HOME_URL com cookies de localização já atualizados.
-    Intercepta qualquer /site-api/ com lat/lon na URL (substitui coordenadas).
-    Captura o primeiro response que retornar merchant UUIDs — não exige
-    lat/lon na URL, pois /restaurantes pode usar cookies como fonte.
-    """
     req_info  = {}
     resp_data = {}
     done      = asyncio.Event()
@@ -246,7 +264,6 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
         url     = request.url
         new_url = build_url(url, lat, lon) if ('latitude=' in url or 'longitude=' in url) else url
 
-        # Captura metadados do primeiro request /site-api/
         if not req_info and 'site-api' in url:
             req_info['url']         = new_url
             req_info['method']      = request.method
@@ -297,12 +314,6 @@ async def crawl_point(page, lat: float, lon: float, timeout: float = 35.0) -> di
 
 
 async def ensure_session(page, context) -> bool:
-    """
-    Navega para HOME_URL uma vez antes do crawl para que o browser
-    use o refresh token e atualize o JWT se estiver expirado.
-    Salva a sessão renovada de volta no disco.
-    Retorna True se o cookie aAccessToken estiver presente após a navegação.
-    """
     print('[*] Verificando/renovando sessao...')
     try:
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
@@ -327,45 +338,41 @@ async def main(step_km: float, delay: float, headless: bool):
     jsonl_path = out_dir / 'requests.jsonl'
     log_path   = out_dir / 'crawl.log'
 
-    seen_ids      = set()
-    total_new     = 0
-    detected_api  = None
+    seen_ids     = set()
+    total_new    = 0
+    detected_api = None
+
+    CHROME_PROFILE.mkdir(exist_ok=True)
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        # launch_persistent_context mantém cookies/histórico entre execuções,
+        # fazendo o browser parecer um usuário real para o Akamai
+        context = await p.chromium.launch_persistent_context(
+            str(CHROME_PROFILE),
             headless=headless,
             channel='chrome',
-            args=['--lang=pt-BR'],
-        )
-        ctx_kwargs = dict(
             locale='pt-BR',
             timezone_id='America/Sao_Paulo',
             user_agent=(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/148.0.0.0 Safari/537.36'
+                'Chrome/136.0.0.0 Safari/537.36'
             ),
+            args=CHROME_ARGS,
         )
-        if SESSION_FILE.exists():
-            ctx_kwargs['storage_state'] = str(SESSION_FILE)
-            print(f'[*] Sessao carregada de: {SESSION_FILE}')
-        else:
-            print(f'[!] session.json nao encontrado — execute login.py primeiro')
 
-        context = await browser.new_context(**ctx_kwargs)
-        page    = await context.new_page()
-
+        page = await context.new_page()
         await page.add_init_script(STEALTH_SCRIPT)
         if HAS_STEALTH:
             await stealth_async(page)
             print('[*] playwright-stealth aplicado')
         else:
-            print('[*] Stealth manual aplicado (playwright-stealth nao instalado)')
+            print('[*] Stealth aplicado (cdc_ cleanup + webdriver patch)')
 
         logged_in = await ensure_session(page, context)
         if not logged_in:
             print('[!] Sessao invalida ou expirada. Execute login.py e tente novamente.')
-            await browser.close()
+            await context.close()
             return
         print('[+] Sessao valida. Iniciando crawl.')
 
@@ -388,7 +395,6 @@ async def main(step_km: float, delay: float, headless: bool):
                     if 'error' in result:
                         raise Exception(result['error'])
 
-                    # Loga o endpoint detectado na primeira captura bem-sucedida
                     if detected_api is None and result.get('api_url'):
                         detected_api = result['api_url'].split('?')[0]
                         msg = f'[+] Endpoint detectado: {detected_api}'
@@ -402,7 +408,6 @@ async def main(step_km: float, delay: float, headless: bool):
                     jf.write(json.dumps(record, ensure_ascii=False) + '\n')
                     jf.flush()
 
-                    # Persiste tokens renovados pelo browser (evita expiração durante o crawl)
                     await context.storage_state(path=str(SESSION_FILE))
 
                     line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
@@ -426,7 +431,7 @@ async def main(step_km: float, delay: float, headless: bool):
         print(f'[+] Requests: {jsonl_path}')
         print(f'[+] Log:      {log_path}')
 
-        await browser.close()
+        await context.close()
 
 
 if __name__ == '__main__':

@@ -10,6 +10,7 @@ import asyncio
 import json
 from pathlib import Path
 from playwright.async_api import async_playwright
+
 try:
     from playwright_stealth import stealth_async
     HAS_STEALTH = True
@@ -17,36 +18,49 @@ except ImportError:
     HAS_STEALTH = False
 
 STEALTH_SCRIPT = """
+(function() {
     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-    Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en-US']});
-    window.chrome = { runtime: {} };
+    Object.keys(window).filter(k => k.startsWith('cdc_')).forEach(k => {
+        try { delete window[k]; } catch(e) {}
+    });
+    window.chrome = {app: {isInstalled: false}, runtime: {connect: () => {}, sendMessage: () => {}}, loadTimes: function(){}, csi: function(){}};
+})();
 """
 
-SESSION_FILE = Path(__file__).parent.parent / 'configs' / 'session.json'
-HOME_URL     = 'https://www.ifood.com.br/inicio'
+SESSION_FILE   = Path(__file__).parent.parent / 'configs' / 'session.json'
+CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
+HOME_URL       = 'https://www.ifood.com.br/inicio'
+CHROME_ARGS    = [
+    '--lang=pt-BR',
+    '--disable-blink-features=AutomationControlled',
+    '--no-first-run',
+    '--no-default-browser-check',
+]
 
 
 async def main():
+    CHROME_PROFILE.mkdir(exist_ok=True)
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(
+        context = await p.chromium.launch_persistent_context(
+            str(CHROME_PROFILE),
             headless=False,
-            channel='chrome',  # usa Chrome instalado, fingerprint mais legítimo
-            args=['--lang=pt-BR'],
-        )
-        context = await browser.new_context(
+            channel='chrome',
             locale='pt-BR',
             timezone_id='America/Sao_Paulo',
             user_agent=(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                 'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/148.0.0.0 Safari/537.36'
+                'Chrome/136.0.0.0 Safari/537.36'
             ),
+            args=CHROME_ARGS,
         )
+
         page = await context.new_page()
         await page.add_init_script(STEALTH_SCRIPT)
         if HAS_STEALTH:
             await stealth_async(page)
+
         await page.goto(HOME_URL, wait_until='domcontentloaded', timeout=45000)
 
         print()
@@ -61,7 +75,7 @@ async def main():
         SESSION_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
         print(f'[+] Sessão salva em: {SESSION_FILE}')
 
-        await browser.close()
+        await context.close()
 
 
 if __name__ == '__main__':
