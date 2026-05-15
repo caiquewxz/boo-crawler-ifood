@@ -65,14 +65,16 @@ CAPTURE_SCRIPT = r"""
         if ((_isBmHome || _isFallback)
                 && url.indexOf('customers') === -1
                 && url.indexOf('wallet') === -1) {
-            // Substitui coordenadas apenas para bm/home — fallback usa search_token proprio
+            // Substitui coordenadas e size apenas para bm/home
             if (_isBmHome) {
                 try {
-                    var tLat = localStorage.getItem('__ifTargetLat');
-                    var tLon = localStorage.getItem('__ifTargetLon');
-                    if (tLat && tLon) {
-                        url = url.replace(/latitude=[^&]+/, 'latitude=' + tLat)
-                                 .replace(/longitude=[^&]+/, 'longitude=' + tLon);
+                    var tLat  = localStorage.getItem('__ifTargetLat');
+                    var tLon  = localStorage.getItem('__ifTargetLon');
+                    var tSize = localStorage.getItem('__ifTargetSize');
+                    if (tLat)  url = url.replace(/latitude=[^&]+/,  'latitude='  + tLat);
+                    if (tLon)  url = url.replace(/longitude=[^&]+/, 'longitude=' + tLon);
+                    if (tSize) url = url.replace(/size=[^&]+/,      'size='      + tSize);
+                    if (tLat || tLon || tSize) {
                         if (typeof args[0] === 'string') args[0] = url;
                         else args[0] = new Request(url, args[0]);
                     }
@@ -284,6 +286,7 @@ def is_restaurant_listing(url: str, body_text: str) -> bool:
 def extract_merchants(data: dict) -> list[dict]:
     """Extrai merchants de cards MERCHANT_LIST_V2 do response bm/home."""
     found = []
+    base_img = (data or {}).get('baseImageUrl', 'https://static-images.ifood.com.br/image/upload')
     for section in (data or {}).get('sections', []):
         for card in section.get('cards', []):
             if card.get('cardType') != 'MERCHANT_LIST_V2':
@@ -293,7 +296,6 @@ def extract_merchants(data: dict) -> list[dict]:
                 name = item.get('name')
                 if not (mid and name):
                     continue
-                # slug pode estar direto ou dentro do campo action
                 slug = item.get('slug') or ''
                 if not slug:
                     action = item.get('action', '')
@@ -301,12 +303,24 @@ def extract_merchants(data: dict) -> list[dict]:
                         params = dict(urllib.parse.parse_qsl(action.split('?', 1)[1]))
                         slug = params.get('slug', '')
                 link = f'https://www.ifood.com.br/delivery/{slug}' if slug else ''
+                delivery = item.get('deliveryInfo') or {}
+                raw_img  = item.get('imageUrl', '')
+                image_url = (base_img + '/t_thumbnail/' + raw_img.lstrip(':')) if raw_img else ''
                 found.append({
-                    'id':       mid,
-                    'name':     name,
-                    'link':     link,
-                    'category': item.get('mainCategory', ''),
-                    'rating':   item.get('userRating'),
+                    'id':                mid,
+                    'name':              name,
+                    'link':              link,
+                    'category':          item.get('mainCategory', ''),
+                    'rating':            item.get('userRating'),
+                    'distance_km':       item.get('distance'),
+                    'delivery_fee':      delivery.get('fee'),         # centavos (dividir por 100)
+                    'delivery_min_min':  delivery.get('timeMinMinutes'),
+                    'delivery_max_min':  delivery.get('timeMaxMinutes'),
+                    'image_url':         image_url,
+                    'is_new':            item.get('isNew'),
+                    'is_super':          item.get('isSuperRestaurant'),
+                    'is_ifood_delivery': item.get('isIfoodDelivery'),
+                    'available':         item.get('available'),
                 })
     return found
 
@@ -488,7 +502,7 @@ _HEADERS_JS = r"""
 """
 
 
-async def crawl_point(tab, lat: float, lon: float, timeout: float = 35.0) -> dict | None:
+async def crawl_point(tab, lat: float, lon: float, page_size: int = 50, timeout: float = 35.0) -> dict | None:
     # request_id -> (url, status)
     pending_resp: dict[str, tuple[str, int]] = {}
     captured: dict = {}
@@ -571,11 +585,12 @@ async def crawl_point(tab, lat: float, lon: float, timeout: float = 35.0) -> dic
         # mesmo que CAPTURE_SCRIPT nao consiga interceptar (ex: service worker).
         await set_location_cookies(tab, lat, lon)
 
-        # Grava coordenadas no localStorage para o CAPTURE_SCRIPT substituir na URL
+        # Grava coordenadas e size no localStorage para o CAPTURE_SCRIPT substituir na URL
         await tab.evaluate(f"""
             try {{
-                localStorage.setItem('__ifTargetLat', '{lat}');
-                localStorage.setItem('__ifTargetLon', '{lon}');
+                localStorage.setItem('__ifTargetLat',  '{lat}');
+                localStorage.setItem('__ifTargetLon',  '{lon}');
+                localStorage.setItem('__ifTargetSize', '{page_size}');
             }} catch(e) {{}}
             window.__ifCapResult = null;
             window.__result = null;
@@ -630,6 +645,7 @@ async def crawl_point(tab, lat: float, lon: float, timeout: float = 35.0) -> dic
         params   = dict(urllib.parse.parse_qsl(parsed.query))
         params['latitude']  = str(lat)
         params['longitude'] = str(lon)
+        params['size']      = str(page_size)
         bm_url = urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(params)))
 
         headers_raw = await tab.evaluate(_HEADERS_JS)
@@ -754,7 +770,7 @@ def _kill_previous_crawler_chrome():
     _clear_profile_locks()
 
 
-async def main(step_km: float, delay: float, headless: bool, max_points: int = 0):
+async def main(step_km: float, delay: float, headless: bool, max_points: int = 0, page_size: int = 50):
     points = generate_grid(step_km=step_km)
     if max_points:
         points = points[:max_points]
@@ -862,7 +878,7 @@ async def main(step_km: float, delay: float, headless: bool, max_points: int = 0
         for i, (lat, lon) in enumerate(points, 1):
             try:
                 await natural_browse(tab)
-                result = await crawl_point(tab, lat, lon)
+                result = await crawl_point(tab, lat, lon, page_size=page_size)
 
                 if result is None:
                     raise Exception('nenhuma chamada API (timeout)')
@@ -929,5 +945,6 @@ if __name__ == '__main__':
     parser.add_argument('--delay',      type=float, default=60.0, help='Delay base entre navegacoes (s)')
     parser.add_argument('--headless',   action='store_true',       help='Rodar sem janela')
     parser.add_argument('--max-points', type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
+    parser.add_argument('--page-size',  type=int,   default=50,   help='Restaurantes por ponto da grade (default 50)')
     args = parser.parse_args()
-    uc.loop().run_until_complete(main(args.step, args.delay, args.headless, args.max_points))
+    uc.loop().run_until_complete(main(args.step, args.delay, args.headless, args.max_points, args.page_size))
