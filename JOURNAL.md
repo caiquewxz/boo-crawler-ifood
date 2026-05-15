@@ -292,6 +292,95 @@ configs/sp_grid.py        →  grade de coordenadas de SP
 
 ---
 
+## Tentativa 14 — Fix de timing do CDP + `set_location_cookies` antecipado
+
+**O que foi feito:**
+- Adicionado handler `ResponseReceived` → só registra status/URL
+- Adicionado handler `LoadingFinished` → chama `get_response_body` aqui (momento correto — body disponível)
+- `set_location_cookies(tab, lat, lon)` chamado **antes** do `tab.get(HOME_URL)` em cada ponto (antes só era chamado via localStorage + CAPTURE_SCRIPT)
+- `bm_req` refatorado para `dict[request_id → url]` — permite matching correto entre request e response em requests paralelos
+- `home:fallback` removido de `EXCLUDED_URL_PARTS` — endpoint retorna 200 sem auth e pode conter dados de merchants
+- Adicionados `--max-points` (limite de pontos para testes rápidos) e `--start-minimized` (Chrome abre minimizado sem roubar foco)
+- `get_all_cookies` (deprecado em nodriver 1.3) substituído por `get_cookies(urls=[...])` em dois lugares
+- Check de sessão agora aguarda até 15s para renovação automática do `aAccessToken`
+
+**Diagnóstico de sessão (2026-05-15):**
+- Rodamos testes e descobrimos que `aAccessToken` estava **expirado**
+- Tentativa de auto-refresh: o iFood web **não faz auto-refresh** do access token — simplesmente mostra 403
+- Testamos ~6 endpoints candidatos de refresh (`marketplace.ifood.com.br`, `consumer-api.ifood.com.br`, `site-api`) → todos 404
+- JWT tem `iss: iFood` (sem URL de endpoint) — endpoint de refresh não é descobrível por tentativa
+- `aRefreshToken` ainda válido por ~178 dias
+
+**Descobertas importantes sobre a API:**
+- `POST /v2/bm/home` retorna **403 mesmo sem nenhum cookie de auth** → o endpoint exige token válido obrigatoriamente
+- `GET /v2/home:fallback?search_token=6gyf4c` retorna **200 sem auth** → potencial fonte de dados sem login
+- `GET /v2/categories` retorna **200 sem auth** → confirma que nem tudo precisa de auth
+- `__NEXT_DATA__` do Next.js SSR tem **0 UUIDs** → iFood não renderiza merchants no servidor; tudo é carregado via API client-side
+
+**Bug crítico identificado: timing do `get_response_body`:**
+- `ResponseReceived` dispara quando os **headers** chegam — body ainda não está no buffer do Chrome
+- `get_response_body` chamado em `ResponseReceived` sempre falha com `No resource with given identifier found [-32000]`
+- Fix: mover `get_response_body` para o handler de `LoadingFinished` — body só está garantido lá
+- Porém: `LoadingFinished` **não dispara** para `home:fallback` — indica que é servido por **Service Worker** ou cache do browser
+
+**Status ao encerrar a sessão:**
+- ✅ Timing de CDP corrigido (LoadingFinished)
+- ✅ Session check com espera de renovação
+- ✅ `set_location_cookies` antes da navegação
+- ❌ `aAccessToken` expirado → precisa rodar `login.py` para continuar
+- ❌ `home:fallback` servido por Service Worker → `get_response_body` não funciona via `LoadingFinished`
+- ❓ Próximo passo: chamar `home:fallback` diretamente via Python requests (com cookies do Chrome profile) ou ler estado Redux/Next do DOM após o carregamento
+
+---
+
+## Tentativa 15 — SW bypass + CAPTURE_SCRIPT para home:fallback (2026-05-15)
+
+**Problemas identificados na Tentativa 14:**
+1. `CAPTURE_SCRIPT` só interceptava `/bm/home` — `home:fallback` passava sem ser capturado
+2. `home:fallback` servido por Service Worker → `LoadingFinished` não disparava → `get_response_body` inacessível
+
+**O que foi feito:**
+
+**Fix 1 — CAPTURE_SCRIPT estendido:**
+```javascript
+// ANTES
+if (url.indexOf('/bm/home') !== -1 && ...)
+
+// DEPOIS
+var _isBmHome  = url.indexOf('/bm/home') !== -1;
+var _isFallback = url.indexOf('home:fallback') !== -1;
+if ((_isBmHome || _isFallback) && ...) {
+    if (_isBmHome) { /* substitui lat/lon */ }
+    // captura ambos
+}
+```
+A chain de execução é: nosso interceptor de `window.fetch` → `fetch` original → SW. Portanto nosso interceptor SEMPRE vê a chamada, independente do SW servir do cache.
+
+**Fix 2 — CDP `set_bypass_service_worker(True)`:**
+```python
+await tab.send(cdp.network.set_bypass_service_worker(bypass=True))
+```
+Força `home:fallback` a ir à rede real, fazendo `LoadingFinished` disparar normalmente. Wrapped em try/except — CDP command disponível desde Chrome 65.
+
+**Fix 3 — `on_response` async com leitura de body SW:**
+```python
+async def on_response(event):
+    ...
+    if getattr(event.response, 'from_service_worker', False) and not cdp_done.is_set():
+        if event.response.status == 200:
+            result = await tab.send(cdp.network.get_response_body(...))
+```
+Para respostas marcadas como `from_service_worker=True`, body já está disponível no buffer do Chrome em `ResponseReceived` (SW tem o response completo antes de entregá-lo).
+
+**Status:**
+- ✅ `aAccessToken` — renovado via `login.py`
+- ✅ CAPTURE_SCRIPT captura `home:fallback`
+- ✅ SW bypass via CDP (se Chrome >= 65)
+- ✅ `on_response` async como fallback para respostas SW
+- ❓ Confirmar captura em teste real após login
+
+---
+
 ## Lições aprendidas
 
 1. **Fingerprint JS ≠ detecção comportamental.** Passar 100% no sannysoft não garante passar pelo Akamai — o Bot Manager tem camadas: fingerprint, TLS, comportamento, reputação de IP
@@ -301,3 +390,10 @@ configs/sp_grid.py        →  grade de coordenadas de SP
 5. **Challenge é assíncrono** — o iframe do Akamai é injetado depois do DOM carregar, não durante
 6. **nodriver bypassa o challenge** por operar em um nível mais baixo (CDP puro, sem protocolo WebDriver)
 7. **JS injection para captura é frágil** — bundlers e service workers podem capturar `window.fetch` antes do patch rodar
+8. **`ResponseReceived` ≠ body disponível.** O body do CDP só está garantido em `LoadingFinished` — chamar `get_response_body` em `ResponseReceived` sempre resulta em erro `-32000`
+9. **iFood não auto-renova o access token via browser.** Token expirado → 403 permanente até novo login manual. Endpoint de refresh não exposto no frontend
+10. **`bm/home` exige auth obrigatoriamente.** Nem mesmo request sem cookies passa — não há acesso anônimo à listagem de merchants via API
+11. **`home:fallback` é candidato para acesso sem auth** (retorna 200), mas é servido por Service Worker — `LoadingFinished` não dispara, body não é lível via CDP tradicional
+12. **`CAPTURE_SCRIPT` intercepta fetch antes do SW** — nosso patch de `window.fetch` roda antes do Service Worker interceptar, portanto captura a resposta mesmo quando o SW serve do cache
+13. **`cdp.network.set_bypass_service_worker(True)`** força requests a ignorar o SW e ir à rede — `LoadingFinished` dispara normalmente após isso
+14. **`from_service_worker`** no objeto `Response` do CDP identifica respostas servidas pelo SW — body disponível imediatamente em `ResponseReceived` (SW entregou o response completo)
