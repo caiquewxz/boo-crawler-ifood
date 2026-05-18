@@ -1,6 +1,6 @@
 # boo-crawler-ifood
 
-Crawler web do iFood para mapeamento completo de restaurantes em São Paulo por grade de coordenadas.
+Crawler web do iFood para mapeamento completo de restaurantes por grade de coordenadas — suporta múltiplas cidades brasileiras.
 
 Controla o Chrome diretamente via CDP (sem WebDriver), contornando o Akamai Bot Manager e extraindo nome, link e metadados de cada restaurante.
 
@@ -48,14 +48,15 @@ O token de acesso (`aAccessToken`) expira em algumas horas. Quando o crawler rep
 ### 2. Crawl
 
 ```powershell
-python scripts\crawl_sp_web_nd.py
+python scripts\crawl.py
 ```
 
 Parâmetros opcionais:
 
 | Parâmetro | Padrão | Descrição |
 |-----------|--------|-----------|
-| `--step` | `8.0` | Espaçamento da grade em km |
+| `--city` | `sao-paulo` | Cidade a crawlear (use `--list-cities` para ver todas) |
+| `--step` | padrão da cidade | Espaçamento da grade em km |
 | `--delay` | `60.0` | Pausa base entre pontos (segundos) |
 | `--headless` | off | Rodar sem janela do browser |
 | `--max-points` | `0` | Limitar pontos (0 = todos). Útil para testes |
@@ -63,21 +64,27 @@ Parâmetros opcionais:
 Exemplos:
 
 ```powershell
-# Teste rapido com 3 pontos
-python scripts\crawl_sp_web_nd.py --max-points 3 --step 8 --delay 15
+# Listar cidades disponíveis
+python scripts\crawl.py --list-cities
 
-# Grade completa de SP (~56 pontos com 8km de espaçamento)
-python scripts\crawl_sp_web_nd.py --step 8 --delay 60
+# SP com ~150 pontos (step padrão 5km)
+python scripts\crawl.py --city sao-paulo
 
-# Grade densa (~900 pontos com 2km, demora horas)
-python scripts\crawl_sp_web_nd.py --step 2 --delay 60 --headless
+# Outra cidade
+python scripts\crawl.py --city rio-de-janeiro
+
+# Teste rápido com 3 pontos
+python scripts\crawl.py --max-points 3 --delay 15
+
+# Grade densa (3km, mais pontos, demora mais)
+python scripts\crawl.py --city sao-paulo --step 3 --delay 60 --headless
 ```
 
 ---
 
 ## Saída
 
-Cada execução cria um diretório em `captures/crawl_nd_TIMESTAMP/` com três arquivos:
+Cada execução cria um diretório em `captures/crawl_nd_CIDADE_TIMESTAMP/` com três arquivos:
 
 ### `merchants.jsonl`
 
@@ -118,10 +125,11 @@ Log de progresso com contagem de merchants novos e totais por ponto.
 ```
 boo-crawler-ifood/
 ├── configs/
-│   └── sp_grid.py          # Gerador da grade de coordenadas de SP
+│   ├── cities.py           # Bounding boxes e step padrão de 10 cidades brasileiras
+│   └── sp_grid.py          # Gerador legado (substituído por cities.py)
 ├── scripts/
 │   ├── login.py            # Login manual + salva sessão Chrome
-│   └── crawl_sp_web_nd.py  # Crawler principal (nodriver + CDP)
+│   └── crawl.py            # Crawler principal (nodriver + CDP, multi-cidade)
 ├── captures/               # Saída dos crawls (gitignored)
 ├── requirements.txt
 └── JOURNAL.md              # Diário de desenvolvimento com todas as tentativas

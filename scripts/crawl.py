@@ -1,5 +1,5 @@
 """
-Crawler iFood Web — SP via nodriver (CDP nativo, sem WebDriver).
+Crawler iFood Web — multi-cidade via nodriver (CDP nativo, sem WebDriver).
 
 Metodologia de bypass de bot:
   - nodriver comunica com Chrome diretamente via CDP sem ChromeDriver
@@ -14,10 +14,12 @@ Metodologia de bypass de bot:
 Uso:
     pip install nodriver
     python scripts/login.py
-    python scripts/crawl_sp_web_nd.py [--step 8.0] [--delay 60.0] [--headless]
+    python scripts/crawl.py [--city sao-paulo] [--step 5.0] [--delay 60.0] [--headless]
+    python scripts/crawl.py --list-cities
 
-Saida em captures/crawl_nd_TIMESTAMP/:
+Saida em captures/crawl_nd_CIDADE_TIMESTAMP/:
     requests.jsonl  — um JSON por linha com request + response
+    merchants.jsonl — merchants unicos encontrados
     crawl.log       — progresso e contagem de merchants unicos
 """
 
@@ -38,7 +40,7 @@ import nodriver as uc
 from nodriver import cdp
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.sp_grid import generate_grid
+from configs.cities import CITIES, generate_city_grid
 
 HOME_URL       = 'https://www.ifood.com.br/restaurantes'
 IFOOD_HOST     = 'www.ifood.com.br'
@@ -770,14 +772,17 @@ def _kill_previous_crawler_chrome():
     _clear_profile_locks()
 
 
-async def main(step_km: float, delay: float, headless: bool, max_points: int = 0, page_size: int = 50):
-    points = generate_grid(step_km=step_km)
+async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 50):
+    city_cfg = CITIES[city]
+    points   = generate_city_grid(city, step_km=step_km)
+    used_step = step_km if step_km is not None else city_cfg['step_km']
     if max_points:
         points = points[:max_points]
-    print(f'[*] Grade {step_km} km: {len(points)} pontos')
+    print(f'[*] Cidade: {city_cfg["name"]}')
+    print(f'[*] Grade {used_step} km: {len(points)} pontos')
 
     ts              = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir         = Path(__file__).parent.parent / 'captures' / f'crawl_nd_{ts}'
+    out_dir         = Path(__file__).parent.parent / 'captures' / f'crawl_nd_{city}_{ts}'
     out_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path      = out_dir / 'requests.jsonl'
     merchants_path  = out_dir / 'merchants.jsonl'
@@ -872,6 +877,7 @@ async def main(step_km: float, delay: float, headless: bool, max_points: int = 0
          open(merchants_path, 'w', encoding='utf-8') as mf, \
          open(log_path,       'w', encoding='utf-8') as lf:
 
+        lf.write(f'Cidade: {city_cfg["name"]}\n')
         lf.write(f'Inicio: {datetime.now()}\n')
         lf.write(f'Pontos: {len(points)}\n\n')
 
@@ -940,11 +946,31 @@ async def main(step_km: float, delay: float, headless: bool, max_points: int = 0
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Crawler iFood Web SP (nodriver)')
-    parser.add_argument('--step',       type=float, default=8.0,  help='Espacamento da grade em km')
-    parser.add_argument('--delay',      type=float, default=60.0, help='Delay base entre navegacoes (s)')
-    parser.add_argument('--headless',   action='store_true',       help='Rodar sem janela')
-    parser.add_argument('--max-points', type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
-    parser.add_argument('--page-size',  type=int,   default=50,   help='Restaurantes por ponto da grade (default 50)')
+    parser = argparse.ArgumentParser(description='Crawler iFood Web (nodriver) — multi-cidade')
+    parser.add_argument('--city',        default='sao-paulo',
+                        help='Cidade a crawlear (default: sao-paulo)')
+    parser.add_argument('--list-cities', action='store_true',
+                        help='Lista cidades disponíveis e sai')
+    parser.add_argument('--step',        type=float, default=None,
+                        help='Espacamento da grade em km (None = usa padrão da cidade)')
+    parser.add_argument('--delay',       type=float, default=60.0, help='Delay base entre navegacoes (s)')
+    parser.add_argument('--headless',    action='store_true',      help='Rodar sem janela')
+    parser.add_argument('--max-points',  type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
+    parser.add_argument('--page-size',   type=int,   default=50,   help='Restaurantes por ponto da grade (default 50)')
     args = parser.parse_args()
-    uc.loop().run_until_complete(main(args.step, args.delay, args.headless, args.max_points, args.page_size))
+
+    if args.list_cities:
+        print(f"\n{'Chave':<20} {'Cidade':<28} {'Step padrão':<14} {'Pontos aprox.'}")
+        print('-' * 72)
+        from configs.cities import generate_city_grid as _gcg
+        for key, cfg in CITIES.items():
+            n = len(_gcg(key))
+            print(f"  {key:<18} {cfg['name']:<28} {cfg['step_km']:<14.1f} ~{n}")
+        print()
+        sys.exit(0)
+
+    if args.city not in CITIES:
+        print(f"[!] Cidade '{args.city}' não encontrada. Use --list-cities para ver as opções.")
+        sys.exit(1)
+
+    uc.loop().run_until_complete(main(args.city, args.step, args.delay, args.headless, args.max_points, args.page_size))
