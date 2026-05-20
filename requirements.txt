@@ -1,3 +1,6 @@
 # Python 3.10+ required
 nodriver>=0.38
 playwright>=1.40
+shapely>=2.0
+requests>=2.31
+flask>=3.0

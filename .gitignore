@@ -2,6 +2,9 @@
 captures/
 configs/session.json
 
+# Cache de polígonos GeoJSON (gerado automaticamente via OSM)
+configs/cache/
+
 # Perfil do Chrome usado pelo crawler
 .chrome-profile/
 

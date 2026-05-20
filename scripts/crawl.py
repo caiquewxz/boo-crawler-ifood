@@ -772,9 +772,9 @@ def _kill_previous_crawler_chrome():
     _clear_profile_locks()
 
 
-async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 50):
+async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 50, use_boundary: bool = False):
     city_cfg = CITIES[city]
-    points   = generate_city_grid(city, step_km=step_km)
+    points   = generate_city_grid(city, step_km=step_km, use_boundary=use_boundary)
     used_step = step_km if step_km is not None else city_cfg['step_km']
     if max_points:
         points = points[:max_points]
@@ -787,6 +787,7 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
     jsonl_path      = out_dir / 'requests.jsonl'
     merchants_path  = out_dir / 'merchants.jsonl'
     log_path        = out_dir / 'crawl.log'
+    points_path     = out_dir / 'points.jsonl'
 
     seen_ids     = set()
     total_new    = 0
@@ -875,7 +876,8 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
 
     with open(jsonl_path,     'w', encoding='utf-8') as jf, \
          open(merchants_path, 'w', encoding='utf-8') as mf, \
-         open(log_path,       'w', encoding='utf-8') as lf:
+         open(log_path,       'w', encoding='utf-8') as lf, \
+         open(points_path,    'w', encoding='utf-8') as pf:
 
         lf.write(f'Cidade: {city_cfg["name"]}\n')
         lf.write(f'Inicio: {datetime.now()}\n')
@@ -907,6 +909,14 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
                                     ensure_ascii=False) + '\n')
                 jf.flush()
 
+                pf.write(json.dumps({
+                    'index': i, 'lat': lat, 'lon': lon,
+                    'count': len(all_here), 'total': total_new,
+                    'names': [m['name'] for m in all_here[:10]],
+                    'error': False,
+                }, ensure_ascii=False) + '\n')
+                pf.flush()
+
                 line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
                         f'status={result.get("status")} novos={len(new_here)} total={total_new}')
                 if new_here:
@@ -915,6 +925,11 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
                     line   += f'\n  -> {preview}{extra}'
 
             except Exception as e:
+                pf.write(json.dumps({
+                    'index': i, 'lat': lat, 'lon': lon,
+                    'count': 0, 'total': total_new, 'names': [], 'error': True,
+                }, ensure_ascii=False) + '\n')
+                pf.flush()
                 line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) ERRO: {e}'
 
             print(line); lf.write(line + '\n'); lf.flush()
@@ -957,6 +972,7 @@ if __name__ == '__main__':
     parser.add_argument('--headless',    action='store_true',      help='Rodar sem janela')
     parser.add_argument('--max-points',  type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
     parser.add_argument('--page-size',   type=int,   default=50,   help='Restaurantes por ponto da grade (default 50)')
+    parser.add_argument('--boundary',    action='store_true',      help='Filtrar grade pelo polígono real do município via OSM (requer shapely e requests)')
     args = parser.parse_args()
 
     if args.list_cities:
@@ -973,4 +989,4 @@ if __name__ == '__main__':
         print(f"[!] Cidade '{args.city}' não encontrada. Use --list-cities para ver as opções.")
         sys.exit(1)
 
-    uc.loop().run_until_complete(main(args.city, args.step, args.delay, args.headless, args.max_points, args.page_size))
+    uc.loop().run_until_complete(main(args.city, args.step, args.delay, args.headless, args.max_points, args.page_size, args.boundary))
