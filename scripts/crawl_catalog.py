@@ -132,8 +132,8 @@ def _safe_name(name: str) -> str:
 
 
 def store_folder(base_dir: Path, merchant_id: str, merchant_name: str) -> Path:
-    """Retorna o Path da pasta da loja: {base_dir}/{uuid}-{nome}."""
-    return base_dir / f"{merchant_id}-{_safe_name(merchant_name)}"
+    """Retorna o Path da pasta da loja: {base_dir}/{nome}-{uuid}."""
+    return base_dir / f"{_safe_name(merchant_name)}-{merchant_id}"
 
 
 def is_done(folder: Path) -> bool:
@@ -474,7 +474,6 @@ async def main(
         if result:
             folder.mkdir(parents=True, exist_ok=True)
 
-            # catalog.json — resposta bruta + metadados
             catalog_out = {
                 'merchant_id':   merchant['id'],
                 'merchant_name': merchant['name'],
@@ -487,14 +486,9 @@ async def main(
                 json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
             )
 
-            # products.jsonl — um produto por linha, preço em centavos e BRL
-            products = extract_products(result['catalog'])
-            with open(folder / 'products.jsonl', 'w', encoding='utf-8') as pf:
-                for p in products:
-                    pf.write(json.dumps(p, ensure_ascii=False) + '\n')
-
             ok_count += 1
-            print(f'  -> {len(products)} produtos  [{folder.name}]')
+            n_items = _count_catalog_items(result['catalog'])
+            print(f'  -> {n_items} itens  [{folder.name}]')
         else:
             fail_count += 1
             print('  -> FALHOU (sem catalogo)')
