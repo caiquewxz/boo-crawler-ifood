@@ -26,11 +26,15 @@ Dependencias extras:
 import asyncio
 import argparse
 import base64
+import ctypes
 import json
 import random
 import re
+import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -248,6 +252,123 @@ def _stop_chrome(pid: int | None):
 
 
 # ---------------------------------------------------------------------------
+# Leitura de cookies do Chrome real (Windows DPAPI + AES-GCM)
+# ---------------------------------------------------------------------------
+
+def _dpapi_decrypt(data: bytes) -> bytes:
+    class _BLOB(ctypes.Structure):
+        _fields_ = [('cbData', ctypes.c_ulong), ('pbData', ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    b_in = _BLOB(len(data), buf)
+    b_out = _BLOB()
+    ok = ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(b_in), None, None, None, None, 0, ctypes.byref(b_out)
+    )
+    if not ok:
+        raise RuntimeError('DPAPI decrypt failed')
+    result = ctypes.string_at(b_out.pbData, b_out.cbData)
+    ctypes.windll.kernel32.LocalFree(b_out.pbData)
+    return result
+
+
+def _read_real_chrome_cookies() -> list[dict]:
+    """Decripta cookies do Chrome real (SQLite + DPAPI/AES-GCM) para ifood.com.br."""
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        return []
+
+    user_data = Path.home() / 'AppData' / 'Local' / 'Google' / 'Chrome' / 'User Data'
+    local_state_path = user_data / 'Local State'
+    cookies_db = user_data / 'Default' / 'Network' / 'Cookies'
+    if not cookies_db.exists():
+        cookies_db = user_data / 'Default' / 'Cookies'
+    if not local_state_path.exists() or not cookies_db.exists():
+        return []
+
+    try:
+        local_state = json.loads(local_state_path.read_text(encoding='utf-8'))
+        enc_key = base64.b64decode(local_state['os_crypt']['encrypted_key'])[5:]
+        aes_key = _dpapi_decrypt(enc_key)
+    except Exception:
+        return []
+
+    def _decrypt(enc: bytes) -> str:
+        if not enc:
+            return ''
+        if enc[:3] == b'v10':
+            try:
+                return AESGCM(aes_key).decrypt(enc[3:15], enc[15:], None).decode('utf-8', errors='replace')
+            except Exception:
+                return ''
+        try:
+            return _dpapi_decrypt(enc).decode('utf-8', errors='replace')
+        except Exception:
+            return ''
+
+    _SAMESITE = {-1: 'Lax', 0: 'None', 1: 'Lax', 2: 'Strict'}
+
+    tmp = Path(tempfile.mktemp(suffix='.db'))
+    try:
+        shutil.copy2(cookies_db, tmp)
+        conn = sqlite3.connect(tmp)
+        rows = conn.execute(
+            'SELECT name, value, encrypted_value, host_key, path, '
+            'is_secure, is_httponly, samesite, expires_utc '
+            'FROM cookies WHERE host_key LIKE "%ifood.com.br%"'
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    result = []
+    for name, value, enc_value, host, path, secure, http_only, samesite, expires_utc in rows:
+        v = value or _decrypt(enc_value)
+        if not v:
+            continue
+        expires = int(expires_utc / 1_000_000 - 11_644_473_600) if expires_utc > 0 else -1
+        result.append({
+            'name': name, 'value': v,
+            'domain': host, 'path': path,
+            'secure': bool(secure), 'httpOnly': bool(http_only),
+            'sameSite': _SAMESITE.get(samesite, 'Lax'),
+            'expires': expires,
+        })
+    return result
+
+
+async def _inject_real_chrome_cookies(tab) -> None:
+    """Injeta cookies do Chrome real no browser antes de navegar para o iFood."""
+    cookies = _read_real_chrome_cookies()
+    if not cookies:
+        print('[*] Sem cookies do Chrome real para injetar (Chrome fechado ou nao instalado?)')
+        return
+    injected = 0
+    for c in cookies:
+        try:
+            sm = c['sameSite']
+            same_site_val = cdp.network.CookieSameSite(sm) if sm in ('Strict', 'Lax', 'None') else None
+            kwargs = dict(
+                name=c['name'], value=c['value'],
+                domain=c['domain'], path=c['path'],
+                secure=c['secure'], http_only=c['httpOnly'],
+            )
+            if same_site_val is not None:
+                kwargs['same_site'] = same_site_val
+            if c['expires'] > 0:
+                kwargs['expires'] = cdp.network.TimeSinceEpoch(c['expires'])
+            await tab.send(cdp.network.set_cookie(**kwargs))
+            injected += 1
+        except Exception:
+            pass
+    px = [c['name'] for c in cookies if c['name'].startswith('_px') or c['name'] == 'pxcts']
+    print(f'[+] {injected}/{len(cookies)} cookies do Chrome real injetados '
+          f'(PX: {px if px else "nenhum"})')
+
+
+# ---------------------------------------------------------------------------
 # Captura de sessao via browser
 # ---------------------------------------------------------------------------
 
@@ -289,6 +410,9 @@ async def capture_session(headless: bool = False, proxy: str | None = None) -> S
         await tab.send(cdp.network.set_bypass_service_worker(bypass=True))
     except Exception:
         pass
+
+    # Injeta cookies do Chrome real antes de navegar — _pxvid ja conhecido pelo HUMAN Security
+    await _inject_real_chrome_cookies(tab)
 
     # Aguarda sessao valida
     print('[*] Verificando sessao...')
