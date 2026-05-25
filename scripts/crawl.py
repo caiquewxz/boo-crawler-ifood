@@ -849,25 +849,106 @@ def _kill_previous_crawler_chrome():
     _clear_profile_locks()
 
 
-async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 100, use_boundary: bool = False):
-    city_cfg = CITIES[city]
-    points   = generate_city_grid(city, step_km=step_km, use_boundary=use_boundary)
+def _save_meta_nd(out_dir: Path, city: str, step_km: float, delay: float,
+                  page_size: int, use_boundary: bool) -> None:
+    meta = {
+        'city': city, 'step_km': step_km, 'delay': delay,
+        'page_size': page_size, 'boundary': use_boundary,
+        'started_at': datetime.now().isoformat(),
+    }
+    (out_dir / 'crawl_meta.json').write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+
+
+def _load_resume_state_nd(resume_dir: Path) -> tuple[str, float, float, int, bool, set, set, int]:
+    meta_file = resume_dir / 'crawl_meta.json'
+    if not meta_file.exists():
+        raise FileNotFoundError(
+            f'crawl_meta.json não encontrado em {resume_dir}.\n'
+            'Apenas capturas iniciadas após esta versão suportam retomada.'
+        )
+    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+
+    done_coords: set[tuple[float, float]] = set()
+    points_file = resume_dir / 'points.jsonl'
+    if points_file.exists():
+        for line in points_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                p = json.loads(line)
+                done_coords.add((p['lat'], p['lon']))
+            except Exception:
+                pass
+
+    seen_ids: set[str] = set()
+    total_new = 0
+    merchants_file = resume_dir / 'merchants.jsonl'
+    if merchants_file.exists():
+        for line in merchants_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+                mid = m.get('id')
+                if mid:
+                    seen_ids.add(mid)
+                    total_new += 1
+            except Exception:
+                pass
+
+    return (
+        meta['city'], meta['step_km'], meta['delay'],
+        meta['page_size'], meta['boundary'],
+        done_coords, seen_ids, total_new,
+    )
+
+
+async def main(city: str, step_km: float | None, delay: float, headless: bool,
+               max_points: int = 0, page_size: int = 100, use_boundary: bool = False,
+               resume_dir: Path | None = None):
+
+    done_coords: set[tuple[float, float]] = set()
+    resuming = resume_dir is not None
+    if resuming:
+        print(f'[*] Retomando captura: {resume_dir}')
+        city, step_km, delay, page_size, use_boundary, \
+            done_coords, seen_ids, total_new = _load_resume_state_nd(resume_dir)
+        out_dir = resume_dir
+        print(f'[*] {len(done_coords)} pontos já processados, {total_new} merchants carregados.')
+    else:
+        seen_ids  = set()
+        total_new = 0
+
+    city_cfg  = CITIES[city]
+    points    = generate_city_grid(city, step_km=step_km, use_boundary=use_boundary)
     used_step = step_km if step_km is not None else city_cfg['step_km']
     if max_points:
         points = points[:max_points]
+
+    pending = [(lat, lon) for lat, lon in points if (lat, lon) not in done_coords]
+
     print(f'[*] Cidade: {city_cfg["name"]}')
-    print(f'[*] Grade {used_step} km: {len(points)} pontos')
+    print(f'[*] Grade {used_step} km: {len(points)} pontos ({len(pending)} pendentes)')
 
-    ts              = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir         = Path(__file__).parent.parent / 'captures' / f'crawl_nd_{city}_{ts}'
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jsonl_path      = out_dir / 'requests.jsonl'
-    merchants_path  = out_dir / 'merchants.jsonl'
-    log_path        = out_dir / 'crawl.log'
-    points_path     = out_dir / 'points.jsonl'
+    if not resuming:
+        ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_dir = Path(__file__).parent.parent / 'captures' / f'crawl_nd_{city}_{ts}'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _save_meta_nd(out_dir, city, used_step, delay, page_size, use_boundary)
 
-    seen_ids     = set()
-    total_new    = 0
+    jsonl_path     = out_dir / 'requests.jsonl'
+    merchants_path = out_dir / 'merchants.jsonl'
+    log_path       = out_dir / 'crawl.log'
+    points_path    = out_dir / 'points.jsonl'
+
+    if not pending:
+        print('[+] Todos os pontos já foram processados.')
+        return
+
     detected_api = None
     browser_pid  = None
 
@@ -953,16 +1034,21 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
     _start_skip_listener()
     print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular o ponto atual.\n')
 
-    with open(jsonl_path,     'w', encoding='utf-8') as jf, \
-         open(merchants_path, 'w', encoding='utf-8') as mf, \
-         open(log_path,       'w', encoding='utf-8') as lf, \
-         open(points_path,    'w', encoding='utf-8') as pf:
+    file_mode = 'a' if resuming else 'w'
 
-        lf.write(f'Cidade: {city_cfg["name"]}\n')
-        lf.write(f'Inicio: {datetime.now()}\n')
-        lf.write(f'Pontos: {len(points)}\n\n')
+    with open(jsonl_path,     file_mode, encoding='utf-8') as jf, \
+         open(merchants_path, file_mode, encoding='utf-8') as mf, \
+         open(log_path,       file_mode, encoding='utf-8') as lf, \
+         open(points_path,    file_mode, encoding='utf-8') as pf:
 
-        for i, (lat, lon) in enumerate(points, 1):
+        if resuming:
+            lf.write(f'\n--- Retomada: {datetime.now()} ({len(pending)} pontos pendentes) ---\n\n')
+        else:
+            lf.write(f'Cidade: {city_cfg["name"]}\n')
+            lf.write(f'Inicio: {datetime.now()}\n')
+            lf.write(f'Pontos: {len(points)}\n\n')
+
+        for i, (lat, lon) in enumerate(pending, len(done_coords) + 1):
             # Retry loop — tenta até funcionar ou usuário pular
             retry   = 0
             skipped = False
@@ -1071,6 +1157,8 @@ if __name__ == '__main__':
     parser.add_argument('--max-points',  type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
     parser.add_argument('--page-size',   type=int,   default=100,  help='Restaurantes por ponto da grade (default 100)')
     parser.add_argument('--boundary',    action='store_true',      help='Filtrar grade pelo polígono real do município via OSM (requer shapely e requests)')
+    parser.add_argument('--resume',      type=Path,  default=None, metavar='DIR',
+                        help='Retoma uma captura anterior a partir do diretório informado')
     args = parser.parse_args()
 
     if args.list_cities:
@@ -1083,8 +1171,19 @@ if __name__ == '__main__':
         print()
         sys.exit(0)
 
-    if args.city not in CITIES:
-        print(f"[!] Cidade '{args.city}' não encontrada. Use --list-cities para ver as opções.")
-        sys.exit(1)
-
-    uc.loop().run_until_complete(main(args.city, args.step, args.delay, args.headless, args.max_points, args.page_size, args.boundary))
+    if args.resume:
+        if not args.resume.exists():
+            print(f'[!] Diretório não encontrado: {args.resume}')
+            sys.exit(1)
+        uc.loop().run_until_complete(main(
+            city='', step_km=None, delay=60.0, headless=args.headless,
+            resume_dir=args.resume,
+        ))
+    else:
+        if args.city not in CITIES:
+            print(f"[!] Cidade '{args.city}' não encontrada. Use --list-cities para ver as opções.")
+            sys.exit(1)
+        uc.loop().run_until_complete(main(
+            args.city, args.step, args.delay, args.headless,
+            args.max_points, args.page_size, args.boundary,
+        ))

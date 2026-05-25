@@ -577,6 +577,75 @@ def filter_new(merchants: list[dict], seen: set) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def _save_meta(out_dir: Path, city: str, step_km: float, delay: float,
+               page_size: int, use_boundary: bool, proxy: str | None) -> None:
+    meta = {
+        'city': city, 'step_km': step_km, 'delay': delay,
+        'page_size': page_size, 'boundary': use_boundary,
+        'proxy': proxy, 'started_at': datetime.now().isoformat(),
+    }
+    (out_dir / 'crawl_meta.json').write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+
+
+def _load_resume_state(resume_dir: Path) -> tuple[str, float, float, int, bool, str | None, set, set, int]:
+    """
+    Lê crawl_meta.json + points.jsonl + merchants.jsonl de uma captura anterior.
+
+    Retorna (city, step_km, delay, page_size, boundary, proxy,
+             done_coords, seen_ids, total_new).
+    done_coords: set de (lat, lon) já processados (sucesso ou pulado).
+    """
+    meta_file = resume_dir / 'crawl_meta.json'
+    if not meta_file.exists():
+        raise FileNotFoundError(
+            f'crawl_meta.json não encontrado em {resume_dir}.\n'
+            'Apenas capturas iniciadas após esta versão suportam retomada.'
+        )
+    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+
+    done_coords: set[tuple[float, float]] = set()
+    points_file = resume_dir / 'points.jsonl'
+    if points_file.exists():
+        for line in points_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                p = json.loads(line)
+                done_coords.add((p['lat'], p['lon']))
+            except Exception:
+                pass
+
+    seen_ids: set[str] = set()
+    total_new = 0
+    merchants_file = resume_dir / 'merchants.jsonl'
+    if merchants_file.exists():
+        for line in merchants_file.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+                mid = m.get('id')
+                if mid:
+                    seen_ids.add(mid)
+                    total_new += 1
+            except Exception:
+                pass
+
+    return (
+        meta['city'], meta['step_km'], meta['delay'],
+        meta['page_size'], meta['boundary'], meta.get('proxy'),
+        done_coords, seen_ids, total_new,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -589,22 +658,46 @@ async def main(
     page_size: int = 100,
     use_boundary: bool = False,
     proxy: str | None = None,
+    resume_dir: Path | None = None,
 ):
+    # --- resume: carrega estado anterior e sobrescreve parâmetros ---
+    done_coords: set[tuple[float, float]] = set()
+    resuming = resume_dir is not None
+    if resuming:
+        print(f'[*] Retomando captura: {resume_dir}')
+        city, step_km, delay, page_size, use_boundary, proxy, \
+            done_coords, seen_ids, total_new = _load_resume_state(resume_dir)
+        out_dir = resume_dir
+        print(f'[*] {len(done_coords)} pontos já processados, {total_new} merchants carregados.')
+    else:
+        seen_ids  = set()
+        total_new = 0
+
     city_cfg  = CITIES[city]
     points    = generate_city_grid(city, step_km=step_km, use_boundary=use_boundary)
     used_step = step_km if step_km is not None else city_cfg['step_km']
     if max_points:
         points = points[:max_points]
+
+    pending = [(lat, lon) for lat, lon in points if (lat, lon) not in done_coords]
+
     print(f'[*] Cidade: {city_cfg["name"]}')
-    print(f'[*] Grade {used_step} km: {len(points)} pontos')
+    print(f'[*] Grade {used_step} km: {len(points)} pontos ({len(pending)} pendentes)')
     print(f'[*] Delay: {delay}s (+-20% jitter)')
 
-    ts             = datetime.now().strftime('%Y%m%d_%H%M%S')
-    out_dir        = Path(__file__).parent.parent / 'captures' / f'crawl_api_{city}_{ts}'
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if not resuming:
+        ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_dir = Path(__file__).parent.parent / 'captures' / f'crawl_api_{city}_{ts}'
+        out_dir.mkdir(parents=True, exist_ok=True)
+        _save_meta(out_dir, city, used_step, delay, page_size, use_boundary, proxy)
+
     merchants_path = out_dir / 'merchants.jsonl'
     log_path       = out_dir / 'crawl.log'
     points_path    = out_dir / 'points.jsonl'
+
+    if not pending:
+        print('[+] Todos os pontos já foram processados.')
+        return
 
     print(f'[*] Salvando em: {out_dir}\n')
 
@@ -617,12 +710,12 @@ async def main(
     _start_skip_listener()
     print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular o ponto atual.\n')
 
-    seen_ids  = set()
-    total_new = 0
     errors    = 0
 
     transport = httpx.AsyncHTTPTransport(retries=2)
     timeout   = httpx.Timeout(20.0, connect=10.0)
+
+    file_mode = 'a' if resuming else 'w'
 
     async with httpx.AsyncClient(
         transport=transport,
@@ -630,15 +723,18 @@ async def main(
         follow_redirects=True,
     ) as client:
 
-        with open(merchants_path, 'w', encoding='utf-8') as mf, \
-             open(log_path,       'w', encoding='utf-8') as lf, \
-             open(points_path,    'w', encoding='utf-8') as pf:
+        with open(merchants_path, file_mode, encoding='utf-8') as mf, \
+             open(log_path,       file_mode, encoding='utf-8') as lf, \
+             open(points_path,    file_mode, encoding='utf-8') as pf:
 
-            lf.write(f'Cidade: {city_cfg["name"]}\n')
-            lf.write(f'Inicio: {datetime.now()}\n')
-            lf.write(f'Pontos: {len(points)}\n\n')
+            if resuming:
+                lf.write(f'\n--- Retomada: {datetime.now()} ({len(pending)} pontos pendentes) ---\n\n')
+            else:
+                lf.write(f'Cidade: {city_cfg["name"]}\n')
+                lf.write(f'Inicio: {datetime.now()}\n')
+                lf.write(f'Pontos: {len(points)}\n\n')
 
-            for i, (lat, lon) in enumerate(points, 1):
+            for i, (lat, lon) in enumerate(pending, len(done_coords) + 1):
                 # Renova sessao proativamente se expirou
                 if session.is_expired():
                     msg = '[*] Renovando sessao (TTL atingido)...'
@@ -745,6 +841,8 @@ if __name__ == '__main__':
                         help='Filtrar grade pelo poligono real do municipio via OSM')
     parser.add_argument('--proxy',       default=None,
                         help='Proxy HTTP/SOCKS5 (ex: http://user:pass@host:port)')
+    parser.add_argument('--resume',      type=Path,  default=None, metavar='DIR',
+                        help='Retoma uma captura anterior a partir do diretório informado')
     args = parser.parse_args()
 
     if args.list_cities:
@@ -757,11 +855,19 @@ if __name__ == '__main__':
         print()
         sys.exit(0)
 
-    if args.city not in CITIES:
-        print(f"[!] Cidade '{args.city}' nao encontrada. Use --list-cities.")
-        sys.exit(1)
-
-    uc.loop().run_until_complete(main(
-        args.city, args.step, args.delay, args.headless,
-        args.max_points, args.page_size, args.boundary, args.proxy,
-    ))
+    if args.resume:
+        if not args.resume.exists():
+            print(f'[!] Diretório não encontrado: {args.resume}')
+            sys.exit(1)
+        uc.loop().run_until_complete(main(
+            city='', step_km=None, delay=2.0, headless=args.headless,
+            proxy=args.proxy, resume_dir=args.resume,
+        ))
+    else:
+        if args.city not in CITIES:
+            print(f"[!] Cidade '{args.city}' nao encontrada. Use --list-cities.")
+            sys.exit(1)
+        uc.loop().run_until_complete(main(
+            args.city, args.step, args.delay, args.headless,
+            args.max_points, args.page_size, args.boundary, args.proxy,
+        ))
