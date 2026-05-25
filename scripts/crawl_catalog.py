@@ -1,39 +1,48 @@
 """
-Crawler de catálogos iFood — captura menu completo de cada restaurante.
+Crawler de catálogos iFood — API direta (sem browser por restaurante).
 
-Para cada merchant em merchants.jsonl:
-  - Navega à página da loja no iFood
-  - Intercepta a chamada /merchants/{uuid}/catalog via CDP (3 estratégias)
-  - Salva em {capture_dir}/{uuid}-{nome}/
-      catalog.json    — resposta bruta da API + metadados
-      products.jsonl  — um produto por linha com preço em centavos e BRL
+Lê merchants.jsonl de uma captura anterior (crawl_api.py), captura sessão
+uma única vez via browser e busca o catálogo de cada restaurante via httpx.
+
+Endpoint: GET /site-api/v1/merchants/restaurant/{UUID}/catalog?latitude=...&longitude=...
+Headers extras: access_key, secret_key (interceptados do browser, fallback hardcoded)
 
 Uso:
-    python scripts/crawl_catalog.py --capture-dir captures/crawl_nd_sao-paulo_20260520_120000
-    python scripts/crawl_catalog.py --capture-dir captures/...  --delay 8 --headless
-    python scripts/crawl_catalog.py --capture-dir captures/...  --max 50
+    python scripts/crawl_catalog.py --capture-dir captures/crawl_api_sao-joao-del-rei_20260522_120000
+    python scripts/crawl_catalog.py captures/crawl_api_*/merchants.jsonl
+    python scripts/crawl_catalog.py --capture-dir captures/... --delay 2 --max 50 --headless
 
-    # Legado: passar arquivos merchants.jsonl diretamente
-    python scripts/crawl_catalog.py captures/crawl_nd_*/merchants.jsonl --catalogs-dir catalogs/
+Saida em {capture_dir}/{nome}-{uuid}/:
+    catalog.json    — resposta bruta da API + metadados
+    products.jsonl  — um produto por linha com preco em centavos e BRL
 """
 
 import asyncio
 import argparse
-import base64
 import json
 import random
 import re
 import subprocess
 import sys
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 import nodriver as uc
 from nodriver import cdp
 
 IFOOD_HOST     = 'www.ifood.com.br'
 CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
 _PID_FILE      = CHROME_PROFILE / '.crawler_pid'
+HOME_URL       = 'https://www.ifood.com.br/restaurantes'
+
+SESSION_TTL = 45 * 60
+
+# Fallback hardcoded — capturados via DevTools em 2026-05-22
+_DEFAULT_ACCESS_KEY = '69f181d5-0046-4221-b7b2-deef62bd60d5'
+_DEFAULT_SECRET_KEY = '9ef4fb4f-7a1d-4e0d-a9b1-9b82873297d8'
 
 STEALTH_SCRIPT = r"""
 (function() {
@@ -66,38 +75,40 @@ STEALTH_SCRIPT = r"""
         loadTimes: function() { return {}; },
         csi: function() { return {}; },
     };
-    Object.defineProperty(Notification, 'permission', {get: () => 'default'});
-})();
-"""
-
-CATALOG_CAPTURE_SCRIPT = r"""
-(function() {
-    if (window.__ifCatInstalled) return;
-    window.__ifCatInstalled = true;
-    window.__ifCatResult = null;
-    const _origFetch = window.fetch;
-    window.fetch = function() {
-        const args = Array.from(arguments);
-        let url = '';
-        if (typeof args[0] === 'string') url = args[0];
-        else if (args[0] && typeof args[0].url === 'string') url = args[0].url;
-        if (url.indexOf('/merchants/') !== -1 && url.indexOf('/catalog') !== -1) {
-            var promise = _origFetch.apply(this, args);
-            promise.then(function(r) {
-                var s = r.status;
-                return r.clone().json().then(function(d) {
-                    if (!window.__ifCatResult)
-                        window.__ifCatResult = JSON.stringify({status: s, data: d, url: url});
-                });
-            }).catch(function() {});
-            return promise;
+    try { Object.defineProperty(Notification, 'permission', {get: () => 'default'}); } catch(e) {}
+    try {
+        const _ga = Element.prototype.getAttribute;
+        Element.prototype.getAttribute = function(name) {
+            if (name === 'webdriver') return null;
+            return _ga.apply(this, arguments);
+        };
+    } catch(e) {}
+    try { Object.defineProperty(window, 'domAutomation',           {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, 'domAutomationController', {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, '_Selenium_IDE_Recorder',  {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, '__webdriver_script_fn',   {get: () => undefined, configurable: true}); } catch(e) {}
+    try {
+        if (!window.external || !window.external.AddSearchProvider) {
+            Object.defineProperty(window, 'external', {
+                value: Object.freeze({AddSearchProvider: function(){}, IsSearchProviderInstalled: function(){}}),
+                configurable: true,
+            });
         }
-        return _origFetch.apply(this, args);
-    };
+    } catch(e) {}
+    try {
+        const _nativeToStr = Function.prototype.toString;
+        const _proxied = new WeakSet();
+        Function.prototype.toString = function() {
+            if (_proxied.has(this)) return 'function ' + (this.__nativeName || this.name || '') + '() { [native code] }';
+            return _nativeToStr.call(this);
+        };
+        _proxied.add(Element.prototype.getAttribute);
+        _proxied.add(Function.prototype.toString);
+    } catch(e) {}
 })();
 """
 
-_HEADERS_JS = r"""
+_COOKIES_JS = r"""
 (function() {
     var c = {};
     document.cookie.split(';').forEach(function(s) {
@@ -106,15 +117,21 @@ _HEADERS_JS = r"""
     });
     function d(v) { try { return decodeURIComponent(v||''); } catch(e) { return v||''; } }
     return JSON.stringify({
-        'authorization':          'Bearer ' + d(c['aAccessToken']),
-        'x-ifood-device-id':      d(c['aDeviceId']),
-        'x-ifood-session-id':     d(c['aSessionId']),
-        'x-ifood-user-id':        d(c['aAccountId']),
+        authorization:              'Bearer ' + d(c['aAccessToken']),
+        'x-ifood-device-id':        d(c['aDeviceId']),
+        'x-ifood-session-id':       d(c['aSessionId']),
+        'x-ifood-user-id':          d(c['aAccountId']),
         'x-client-application-key': d(c['aFasterAppKey']),
-        'account_id':             d(c['aAccountId']),
-        'platform':               'Desktop',
-        'browser':                'Windows',
-        'country':                'BR',
+        account_id:                 d(c['aAccountId']),
+        app_version:                d(c['aAppVersion']) || '9.141.4',
+        platform:                   'Desktop',
+        browser:                    'Windows',
+        country:                    'BR',
+        'content-type':             'application/json',
+        'accept':                   'application/json, text/plain, */*',
+        'accept-language':          'pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7',
+        'origin':                   'https://www.ifood.com.br',
+        'referer':                  'https://www.ifood.com.br/restaurantes',
     });
 })()
 """
@@ -123,16 +140,43 @@ _FORBIDDEN_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 
 # ---------------------------------------------------------------------------
+# Session dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CatalogSession:
+    headers: dict
+    cookies: dict
+    access_key: str
+    secret_key: str
+    user_agent: str
+    captured_at: float = field(default_factory=time.time)
+
+    def is_expired(self) -> bool:
+        return (time.time() - self.captured_at) > SESSION_TTL
+
+    def build_url(self, merchant_id: str, lat: float, lon: float) -> str:
+        return (
+            f'https://www.ifood.com.br/site-api/v1/merchants/restaurant'
+            f'/{merchant_id}/catalog?latitude={lat}&longitude={lon}&channel=IFOOD'
+        )
+
+    def request_headers(self, referer: str = '') -> dict:
+        h = {**self.headers, 'access_key': self.access_key, 'secret_key': self.secret_key}
+        if referer:
+            h['referer'] = referer
+        return h
+
+
+# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
 def _safe_name(name: str) -> str:
-    """Remove caracteres inválidos em nomes de pasta Windows, limita a 80 chars."""
     return _FORBIDDEN_RE.sub('-', name).strip().strip('.')[:80]
 
 
 def store_folder(base_dir: Path, merchant_id: str, merchant_name: str) -> Path:
-    """Retorna o Path da pasta da loja: {base_dir}/{nome}-{uuid}."""
     return base_dir / f"{_safe_name(merchant_name)}-{merchant_id}"
 
 
@@ -145,20 +189,11 @@ def is_done(folder: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def extract_products(catalog_data: dict) -> list[dict]:
-    """
-    Extrai lista plana de produtos do response de catálogo iFood.
-
-    Suporta o formato marketplace v1/v2:
-      catalog[].itens[] — cada item tem unitPrice em centavos
-
-    Retorna lista de dicts prontos para serializar em products.jsonl.
-    """
     products = []
-
     for category in (catalog_data.get('catalog') or []):
         cat_name = (category.get('description') or category.get('name') or '').strip()
         for item in (category.get('itens') or category.get('items') or []):
-            price = item.get('unitPrice')
+            price     = item.get('unitPrice')
             price_min = item.get('unitMinPrice') if item.get('unitMinPrice') is not None else price
             products.append({
                 'id':              item.get('code') or item.get('id'),
@@ -174,12 +209,7 @@ def extract_products(catalog_data: dict) -> list[dict]:
                 'need_choices':    item.get('needChoices'),
                 'logo_url':        item.get('logoUrl') or item.get('imageUrl') or '',
             })
-
     return products
-
-
-def _count_catalog_items(catalog_data: dict) -> int:
-    return len(extract_products(catalog_data))
 
 
 # ---------------------------------------------------------------------------
@@ -191,14 +221,14 @@ def _clear_profile_locks():
         (CHROME_PROFILE / f).unlink(missing_ok=True)
 
 
-def _stop_our_chrome(pid: int | None):
+def _stop_chrome(pid: int | None):
     if pid is not None:
         subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], capture_output=True)
     _PID_FILE.unlink(missing_ok=True)
     _clear_profile_locks()
 
 
-def _kill_previous_crawler_chrome():
+def _kill_previous_chrome():
     if _PID_FILE.exists():
         try:
             pid = int(_PID_FILE.read_text().strip())
@@ -217,141 +247,201 @@ def _kill_previous_crawler_chrome():
 
 
 # ---------------------------------------------------------------------------
-# Catalog page capture (3-strategy fallback)
+# Session capture (browser uma vez)
 # ---------------------------------------------------------------------------
 
-def is_catalog_url(url: str) -> bool:
-    return (
-        '/merchants/' in url
-        and '/catalog' in url
-        and not any(x in url for x in ('customers', 'wallet', 'reviews'))
+def _is_catalog_url(url: str) -> bool:
+    return '/merchants/' in url and '/catalog' in url and 'customers' not in url
+
+
+async def capture_session(
+    headless: bool = False,
+    proxy: str | None = None,
+    first_merchant: dict | None = None,
+) -> CatalogSession:
+    """Lança browser, verifica sessão, intercepta access_key/secret_key, fecha browser."""
+    print('[*] Iniciando browser para captura de sessão...')
+
+    chrome_args = [
+        '--lang=pt-BR',
+        '--disable-blink-features=AutomationControlled',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--exclude-switches=enable-automation',
+        '--disable-infobars',
+        '--window-size=1920,1080',
+        '--start-minimized',
+    ]
+    if proxy:
+        chrome_args.append(f'--proxy-server={proxy}')
+
+    browser = await uc.start(
+        user_data_dir=str(CHROME_PROFILE),
+        headless=headless,
+        lang='pt-BR',
+        browser_args=chrome_args,
     )
+    browser_pid = None
+    try:
+        browser_pid = browser.process.pid
+        CHROME_PROFILE.mkdir(exist_ok=True)
+        _PID_FILE.write_text(str(browser_pid))
+    except AttributeError:
+        pass
 
+    tab = await browser.get('about:blank')
+    await tab.send(cdp.page.add_script_to_evaluate_on_new_document(source=STEALTH_SCRIPT))
+    await tab.send(cdp.network.enable())
+    try:
+        await tab.send(cdp.network.set_bypass_service_worker(bypass=True))
+    except Exception:
+        pass
 
-async def crawl_catalog_page(tab, merchant: dict, timeout: float = 40.0) -> dict | None:
-    mid          = merchant['id']
-    delivery_url = merchant.get('link', '')
-    lat          = merchant.get('lat', -23.5489)
-    lon          = merchant.get('lon', -46.6333)
+    print('[*] Verificando sessão...')
+    await tab.get(HOME_URL)
+    deadline = asyncio.get_event_loop().time() + 20.0
+    while asyncio.get_event_loop().time() < deadline:
+        cookies = await tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}']))
+        if any(c.name == 'aAccessToken' and c.value for c in cookies):
+            break
+        print('[*] Aguardando token...')
+        await asyncio.sleep(2.0)
+    else:
+        try:
+            browser.stop()
+        except Exception:
+            pass
+        _stop_chrome(browser_pid)
+        raise RuntimeError('Sessão inválida. Execute login.py primeiro.')
 
-    if not delivery_url:
-        return None
+    print('[+] Token encontrado.')
 
-    pending_resp: dict[str, tuple[str, int]] = {}
-    captured: dict = {}
-    cdp_done = asyncio.Event()
+    # Tenta interceptar access_key/secret_key navegando para uma loja real
+    access_key: list[str] = [_DEFAULT_ACCESS_KEY]
+    secret_key: list[str] = [_DEFAULT_SECRET_KEY]
+    keys_captured = asyncio.Event()
 
     def on_request(event: cdp.network.RequestWillBeSent):
         url = event.request.url
-        if is_catalog_url(url):
-            pending_resp[str(event.request_id)] = (url, 0)
-
-    def on_response(event: cdp.network.ResponseReceived):
-        rid = str(event.request_id)
-        if rid in pending_resp:
-            url = pending_resp[rid][0]
-            pending_resp[rid] = (url, event.response.status)
-
-    async def on_loading_finished(event: cdp.network.LoadingFinished):
-        if cdp_done.is_set():
-            return
-        rid = str(event.request_id)
-        if rid not in pending_resp:
-            return
-        url, status = pending_resp.pop(rid)
-        if status not in (200, 0):
-            return
-        try:
-            result = await tab.send(cdp.network.get_response_body(event.request_id))
-            body_text = (
-                base64.b64decode(result.body).decode('utf-8', errors='replace')
-                if result.base_64_encoded else result.body
-            )
-            data = json.loads(body_text)
-            if data and isinstance(data, dict):
-                captured.update({'url': url, 'data': data})
-                cdp_done.set()
-        except Exception:
-            pass
+        if _is_catalog_url(url):
+            hdrs = {k.lower(): v for k, v in (event.request.headers or {}).items()}
+            ak = hdrs.get('access_key')
+            sk = hdrs.get('secret_key')
+            if ak:
+                access_key[0] = ak
+            if sk:
+                secret_key[0] = sk
+            if ak or sk:
+                keys_captured.set()
 
     tab.add_handler(cdp.network.RequestWillBeSent, on_request)
-    tab.add_handler(cdp.network.ResponseReceived, on_response)
-    tab.add_handler(cdp.network.LoadingFinished, on_loading_finished)
+
+    warmup_url = first_merchant.get('link', '') if first_merchant else ''
+    if warmup_url:
+        print(f'[*] Navegando para loja para interceptar access_key...')
+        await tab.get(warmup_url)
+        await asyncio.sleep(random.uniform(2.0, 4.0))
+        try:
+            await asyncio.wait_for(keys_captured.wait(), timeout=15.0)
+            print(f'[+] access_key/secret_key interceptados via browser')
+        except asyncio.TimeoutError:
+            print('[!] Timeout — usando access_key/secret_key hardcoded')
+    else:
+        await asyncio.sleep(random.uniform(1.5, 3.0))
+        print('[!] Sem URL de loja para warm-up — usando access_key/secret_key hardcoded')
 
     try:
-        await tab.evaluate('window.__ifCatResult = null;')
-        await tab.get(delivery_url)
-        await asyncio.sleep(random.uniform(2.0, 4.0))
+        tab.handlers.get(cdp.network.RequestWillBeSent, []).remove(on_request)
+    except Exception:
+        pass
 
-        # Estrategia 1: CDP LoadingFinished
-        try:
-            await asyncio.wait_for(cdp_done.wait(), timeout=20.0)
-        except asyncio.TimeoutError:
-            pass
+    headers_raw = await tab.evaluate(_COOKIES_JS)
+    headers     = json.loads(headers_raw or '{}')
 
-        if cdp_done.is_set():
-            return {'api_url': captured['url'], 'catalog': captured['data']}
+    user_agent = await tab.evaluate('navigator.userAgent') or (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/124.0.0.0 Safari/537.36'
+    )
+    headers['user-agent'] = user_agent
 
-        # Estrategia 2: CATALOG_CAPTURE_SCRIPT (fetch intercept)
-        raw = await tab.evaluate('window.__ifCatResult')
-        if raw:
-            try:
-                payload = json.loads(raw)
-                data = payload.get('data')
-                if data and isinstance(data, dict):
-                    return {'api_url': payload.get('url', ''), 'catalog': data}
-            except Exception:
-                pass
+    all_cdp_cookies = await tab.send(cdp.network.get_cookies(urls=[
+        f'https://{IFOOD_HOST}',
+        'https://www.ifood.com.br',
+    ]))
+    cookie_jar = {c.name: c.value for c in all_cdp_cookies if c.value}
+    px_cookies = [k for k in cookie_jar if k.startswith('_px') or k == 'pxcts']
+    print(f'[+] Cookies PX: {px_cookies if px_cookies else "nenhum (sensor não rodou?)"}')
 
-        # Estrategia 3: fetch manual — tenta v1 e v2
-        headers_raw = await tab.evaluate(_HEADERS_JS)
-        headers_js  = headers_raw or '{}'
+    _PX_HEADER_ORDER = ('_px3', '_pxhd', '_pxvid', 'pxcts')
+    px_parts = [f'{k}={cookie_jar[k]}' for k in _PX_HEADER_ORDER if k in cookie_jar]
+    if px_parts:
+        headers['x-px-cookies'] = '; '.join(px_parts)
+        print(f'[+] x-px-cookies construído ({len(px_parts)} cookies)')
 
-        for api_version in ('v1', 'v2'):
-            catalog_url = (
-                f'https://www.ifood.com.br/site-api/{api_version}'
-                f'/merchants/{mid}/catalog'
-                f'?latitude={lat}&longitude={lon}&channel=IFOOD'
-            )
-            await tab.evaluate(f"""
-            (function() {{
-                window.__catManual = null;
-                fetch({json.dumps(catalog_url)}, {{
-                    method: 'GET',
-                    credentials: 'include',
-                    cache: 'no-cache',
-                    headers: {headers_js}
-                }})
-                .then(function(r) {{ return r.json(); }})
-                .then(function(d) {{ window.__catManual = JSON.stringify({{ok: true, data: d}}); }})
-                .catch(function(e) {{ window.__catManual = JSON.stringify({{ok: false, err: e.message}}); }});
-            }})();
-            """)
+    try:
+        browser.stop()
+    except Exception:
+        pass
+    _stop_chrome(browser_pid)
 
-            fetch_end = asyncio.get_event_loop().time() + 15.0
-            while asyncio.get_event_loop().time() < fetch_end:
-                raw = await tab.evaluate('window.__catManual')
-                if raw:
-                    result = json.loads(raw)
-                    if result.get('ok') and result.get('data'):
-                        data = result['data']
-                        if isinstance(data, dict) and data:
-                            return {'api_url': catalog_url, 'catalog': data}
-                    break
-                await asyncio.sleep(0.3)
+    session = CatalogSession(
+        headers=headers,
+        cookies=cookie_jar,
+        access_key=access_key[0],
+        secret_key=secret_key[0],
+        user_agent=user_agent,
+    )
+    print(f'[+] Sessão pronta. access_key={session.access_key[:8]}...')
+    print(f'[+] Auth: {"ok" if "Bearer ey" in headers.get("authorization", "") else "VAZIO"}')
+    return session
 
+
+# ---------------------------------------------------------------------------
+# Fetch catalog via httpx
+# ---------------------------------------------------------------------------
+
+_EMPTY = object()  # sentinela — 404/loja inativa
+
+async def fetch_catalog(
+    session: CatalogSession,
+    client: httpx.AsyncClient,
+    merchant: dict,
+) -> dict | None:
+    """
+    Retorna:
+      dict  — catálogo com dados
+      _EMPTY — 404 ou loja inativa (não deve ser retentado)
+      None  — falha de auth ou rede (indica renovação de sessão)
+    """
+    mid = merchant['id']
+    lat = merchant.get('lat', -23.5489)
+    lon = merchant.get('lon', -46.6333)
+
+    url     = session.build_url(mid, lat, lon)
+    referer = merchant.get('link', '')
+    hdrs    = session.request_headers(referer=referer)
+
+    try:
+        resp = await client.get(url, headers=hdrs, cookies=session.cookies)
+
+        if resp.status_code in (401, 403):
+            print(f'  [warn] HTTP {resp.status_code} — sessão inválida (PX ou token)')
+            return None
+
+        if resp.status_code == 404:
+            return _EMPTY
+
+        if resp.status_code != 200:
+            print(f'  [warn] HTTP {resp.status_code}')
+            return None
+
+        data = resp.json()
+        return data if (data and isinstance(data, dict)) else _EMPTY
+
+    except (httpx.TimeoutException, httpx.NetworkError) as e:
+        print(f'  [erro] {e}')
         return None
-
-    finally:
-        for evt_cls, fn in [
-            (cdp.network.RequestWillBeSent, on_request),
-            (cdp.network.ResponseReceived, on_response),
-            (cdp.network.LoadingFinished, on_loading_finished),
-        ]:
-            try:
-                tab.handlers.get(evt_cls, []).remove(fn)
-            except (ValueError, AttributeError):
-                pass
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +452,7 @@ def load_merchants(files: list[Path]) -> list[dict]:
     seen = {}
     for f in files:
         if not f.exists():
-            print(f'[!] Arquivo nao encontrado: {f}')
+            print(f'[!] Arquivo não encontrado: {f}')
             continue
         for line in f.read_text(encoding='utf-8').splitlines():
             line = line.strip()
@@ -371,7 +461,7 @@ def load_merchants(files: list[Path]) -> list[dict]:
             try:
                 m = json.loads(line)
                 mid = m.get('id')
-                if mid and mid not in seen and m.get('link'):
+                if mid and mid not in seen:
                     seen[mid] = m
             except Exception:
                 pass
@@ -388,7 +478,7 @@ async def main(
     delay: float,
     headless: bool,
     max_merchants: int = 0,
-    per_capture: bool = False,
+    proxy: str | None = None,
 ):
     merchants = load_merchants(merchant_files)
     if not merchants:
@@ -398,155 +488,144 @@ async def main(
     if max_merchants:
         merchants = merchants[:max_merchants]
 
-    # Pula lojas cuja pasta já existe e tem catalog.json
     todo = [m for m in merchants if not is_done(store_folder(output_dir, m['id'], m['name']))]
 
-    print(f'[*] {len(merchants)} merchants carregados, {len(todo)} sem catalogo')
+    print(f'[*] {len(merchants)} merchants, {len(todo)} sem catálogo')
     if not todo:
-        print('[+] Todos os catalogos ja foram capturados.')
+        print('[+] Todos os catálogos já foram capturados.')
         return
 
+    output_dir.mkdir(parents=True, exist_ok=True)
     print(f'[*] Salvando em: {output_dir}')
+    print(f'[*] Delay: {delay}s (+-20% jitter)\n')
 
-    _kill_previous_crawler_chrome()
-    await asyncio.sleep(0.5)
+    _kill_previous_chrome()
+    await asyncio.sleep(0.3)
     CHROME_PROFILE.mkdir(exist_ok=True)
 
-    browser = await uc.start(
-        user_data_dir=str(CHROME_PROFILE),
+    session = await capture_session(
         headless=headless,
-        lang='pt-BR',
-        browser_args=[
-            '--lang=pt-BR',
-            '--disable-blink-features=AutomationControlled',
-            '--no-first-run',
-            '--no-default-browser-check',
-            '--exclude-switches=enable-automation',
-            '--disable-infobars',
-            '--window-size=1920,1080',
-            '--start-minimized',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding',
-        ],
+        proxy=proxy,
+        first_merchant=todo[0],
     )
 
-    browser_pid = None
-    try:
-        browser_pid = browser.process.pid
-        CHROME_PROFILE.mkdir(exist_ok=True)
-        _PID_FILE.write_text(str(browser_pid))
-        print(f'[*] Chrome PID: {browser_pid}')
-    except AttributeError:
-        pass
+    ok_count    = 0
+    empty_count = 0
+    fail_count  = 0
+    errors      = 0
 
-    tab = await browser.get('about:blank')
-    await tab.send(cdp.page.add_script_to_evaluate_on_new_document(source=STEALTH_SCRIPT))
-    await tab.send(cdp.page.add_script_to_evaluate_on_new_document(source=CATALOG_CAPTURE_SCRIPT))
-    await tab.send(cdp.network.enable())
+    transport = httpx.AsyncHTTPTransport(retries=2)
+    timeout   = httpx.Timeout(20.0, connect=10.0)
 
-    print('[*] Verificando sessao...')
-    await tab.get('https://www.ifood.com.br/restaurantes')
-    await asyncio.sleep(3.0)
-    cookies = await tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}']))
-    if not any(c.name == 'aAccessToken' and c.value for c in cookies):
-        print('[!] Sessao invalida. Execute login.py e tente novamente.')
-        try:
-            browser.stop()
-        except Exception:
-            pass
-        _stop_our_chrome(browser_pid)
-        return
-    print('[+] Sessao valida.')
-    print(f'[*] Delay base: {delay}s (+-30% jitter)\n')
+    async with httpx.AsyncClient(
+        transport=transport,
+        timeout=timeout,
+        follow_redirects=True,
+    ) as client:
 
-    ok_count   = 0
-    fail_count = 0
+        for i, merchant in enumerate(todo, 1):
+            name_preview = merchant['name'][:50]
+            print(f'[{i:4d}/{len(todo)}] {name_preview}')
 
-    for i, merchant in enumerate(todo, 1):
-        name_preview = merchant['name'][:50]
-        print(f'[{i:4d}/{len(todo)}] {name_preview}')
+            if session.is_expired():
+                print('[*] Renovando sessão (TTL atingido)...')
+                _kill_previous_chrome()
+                await asyncio.sleep(0.3)
+                session = await capture_session(headless=headless, proxy=proxy)
+                errors = 0
 
-        result = await crawl_catalog_page(tab, merchant)
+            result = await fetch_catalog(session, client, merchant)
 
-        folder = store_folder(output_dir, merchant['id'], merchant['name'])
+            folder = store_folder(output_dir, merchant['id'], merchant['name'])
 
-        if result:
-            folder.mkdir(parents=True, exist_ok=True)
+            if result is None:
+                errors += 1
+                fail_count += 1
+                print('  -> ERRO (sessão ou rede)')
 
-            catalog_out = {
-                'merchant_id':   merchant['id'],
-                'merchant_name': merchant['name'],
-                'merchant_link': merchant.get('link', ''),
-                'api_url':       result.get('api_url', ''),
-                'crawled_at':    datetime.now().isoformat(),
-                'catalog':       result['catalog'],
-            }
-            (folder / 'catalog.json').write_text(
-                json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
-            )
+                if errors >= 3:
+                    print(f'[!] {errors} erros consecutivos — renovando sessão...')
+                    _kill_previous_chrome()
+                    await asyncio.sleep(0.3)
+                    session = await capture_session(headless=headless, proxy=proxy)
+                    errors = 0
 
-            ok_count += 1
-            n_items = _count_catalog_items(result['catalog'])
-            print(f'  -> {n_items} itens  [{folder.name}]')
-        else:
-            fail_count += 1
-            print('  -> FALHOU (sem catalogo)')
+            elif result is _EMPTY:
+                errors = 0
+                empty_count += 1
+                folder.mkdir(parents=True, exist_ok=True)
+                catalog_out = {
+                    'merchant_id':   merchant['id'],
+                    'merchant_name': merchant['name'],
+                    'crawled_at':    datetime.now().isoformat(),
+                    'catalog':       None,
+                }
+                (folder / 'catalog.json').write_text(
+                    json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
+                )
+                print('  -> vazio (404 / loja inativa)')
 
-        wait = delay * random.uniform(0.7, 1.3)
-        slept = 0.0
-        while slept < wait:
-            chunk = min(10.0, wait - slept)
-            await asyncio.sleep(chunk)
-            slept += chunk
-            if slept < wait:
-                try:
-                    await tab.send(cdp.target.get_targets())
-                except Exception:
-                    pass
+            else:
+                errors = 0
+                ok_count += 1
+                folder.mkdir(parents=True, exist_ok=True)
 
-    print(f'\n[+] Concluido: {ok_count} ok, {fail_count} falhas')
+                catalog_out = {
+                    'merchant_id':   merchant['id'],
+                    'merchant_name': merchant['name'],
+                    'merchant_link': merchant.get('link', ''),
+                    'crawled_at':    datetime.now().isoformat(),
+                    'catalog':       result,
+                }
+                (folder / 'catalog.json').write_text(
+                    json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
+                )
+
+                products = extract_products(result)
+                if products:
+                    with open(folder / 'products.jsonl', 'w', encoding='utf-8') as pf:
+                        for p in products:
+                            pf.write(json.dumps(p, ensure_ascii=False) + '\n')
+
+                print(f'  -> {len(products)} itens  [{folder.name[:60]}]')
+
+            await asyncio.sleep(delay * random.uniform(0.8, 1.2))
+
+    print(f'\n[+] Concluído: {ok_count} ok, {empty_count} vazios, {fail_count} falhas')
     print(f'[+] Lojas em: {output_dir}')
-
-    try:
-        browser.stop()
-    except Exception:
-        pass
-    _stop_our_chrome(browser_pid)
-    _clear_profile_locks()
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Crawler de catalogos iFood por restaurante')
+    parser = argparse.ArgumentParser(description='Crawler de catálogos iFood — API direta')
     parser.add_argument(
         '--capture-dir', type=Path, metavar='DIR',
-        help='Diretorio de uma captura existente (lê merchants.jsonl de lá e salva lojas lá dentro)',
+        help='Diretório de uma captura existente (lê merchants.jsonl e salva lojas lá dentro)',
     )
     parser.add_argument(
         'merchants', type=Path, nargs='*',
-        help='Um ou mais arquivos merchants.jsonl (legado, use --capture-dir)',
+        help='Um ou mais arquivos merchants.jsonl',
     )
-    parser.add_argument('--catalogs-dir', type=Path,
-                        help='Diretorio de saida para modo legado (default: mesmo dir do primeiro merchants.jsonl)')
-    parser.add_argument('--delay',    type=float, default=8.0,  help='Delay base em segundos (default 8)')
+    parser.add_argument('--out',      type=Path,  help='Diretório de saída (padrão: mesmo do merchants.jsonl)')
+    parser.add_argument('--delay',    type=float, default=2.0,  help='Delay base em segundos (default 2)')
     parser.add_argument('--headless', action='store_true',       help='Rodar sem janela')
-    parser.add_argument('--max',      type=int,   default=0,     help='Processar no max N lojas (0 = todas)')
+    parser.add_argument('--max',      type=int,   default=0,     help='Máx N lojas (0 = todas)')
+    parser.add_argument('--proxy',    default=None,              help='Proxy HTTP/SOCKS5')
     args = parser.parse_args()
 
     if args.capture_dir:
         merchants_file = args.capture_dir / 'merchants.jsonl'
         if not merchants_file.exists():
-            print(f'[!] {merchants_file} nao encontrado.')
+            print(f'[!] {merchants_file} não encontrado.')
             sys.exit(1)
-        output_dir = args.capture_dir
+        output_dir     = args.capture_dir
         merchant_files = [merchants_file]
     elif args.merchants:
         merchant_files = args.merchants
-        output_dir = args.catalogs_dir if args.catalogs_dir else merchant_files[0].parent
+        output_dir     = args.out if args.out else merchant_files[0].parent
         output_dir.mkdir(parents=True, exist_ok=True)
     else:
         parser.error('Especifique --capture-dir PATH ou passe arquivos merchants.jsonl')
 
     uc.loop().run_until_complete(
-        main(merchant_files, output_dir, args.delay, args.headless, args.max)
+        main(merchant_files, output_dir, args.delay, args.headless, args.max, args.proxy)
     )

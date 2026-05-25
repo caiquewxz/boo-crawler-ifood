@@ -104,6 +104,15 @@ CITIES: dict[str, dict] = {
         "step_km": 3.0,   # ~80 pontos
         "osm_query": "Recife, PE, Brazil",
     },
+    "sao-joao-del-rei": {
+        "name": "São João del Rei - MG",
+        "lat_min": -21.130,
+        "lat_max": -21.060,
+        "lon_min": -44.340,
+        "lon_max": -44.180,
+        "step_km": 2.0,   # ~36 pontos — zona urbana real (calibrado pelo log 2026-05-22)
+        "osm_query": "São João del Rei, MG, Brazil",
+    },
 }
 
 

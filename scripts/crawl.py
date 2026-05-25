@@ -240,6 +240,53 @@ STEALTH_SCRIPT = r"""
     };
 
     Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+
+    // --- HUMAN Security / PerimeterX vectors ---
+
+    // CDP seta o atributo 'webdriver' no documentElement — PX checa isso separado do navigator
+    try {
+        const _ga = Element.prototype.getAttribute;
+        Element.prototype.getAttribute = function(name) {
+            if (name === 'webdriver') return null;
+            return _ga.apply(this, arguments);
+        };
+    } catch(e) {}
+
+    // Artefatos do ChromeDriver/Selenium — ausentes no nodriver mas PX verifica mesmo assim
+    try { Object.defineProperty(window, 'domAutomation',           {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, 'domAutomationController', {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, '_Selenium_IDE_Recorder',  {get: () => undefined, configurable: true}); } catch(e) {}
+    try { Object.defineProperty(window, '__webdriver_script_fn',   {get: () => undefined, configurable: true}); } catch(e) {}
+
+    // window.external — ausente no headless, detectado como anomalia
+    try {
+        if (!window.external || !window.external.AddSearchProvider) {
+            Object.defineProperty(window, 'external', {
+                value: Object.freeze({AddSearchProvider: function(){}, IsSearchProviderInstalled: function(){}}),
+                configurable: true,
+            });
+        }
+    } catch(e) {}
+
+    // Protege toString() das funcoes patchadas — PX checa se metodos nativos expoem '[native code]'
+    try {
+        const _nativeToStr = Function.prototype.toString;
+        const _proxied = new WeakSet();
+        const _mark = function(fn, original) {
+            _proxied.add(fn);
+            fn.__nativeName = original.name;
+            return fn;
+        };
+        Function.prototype.toString = function() {
+            if (_proxied.has(this)) {
+                return 'function ' + (this.__nativeName || this.name || '') + '() { [native code] }';
+            }
+            return _nativeToStr.call(this);
+        };
+        // Marca as funcoes ja patchadas acima como "nativas"
+        _mark(Element.prototype.getAttribute, Element.prototype.getAttribute);
+        _mark(Function.prototype.toString, _nativeToStr);
+    } catch(e) {}
 })();
 """
 
@@ -504,7 +551,7 @@ _HEADERS_JS = r"""
 """
 
 
-async def crawl_point(tab, lat: float, lon: float, page_size: int = 50, timeout: float = 35.0) -> dict | None:
+async def crawl_point(tab, lat: float, lon: float, page_size: int = 100, timeout: float = 35.0) -> dict | None:
     # request_id -> (url, status)
     pending_resp: dict[str, tuple[str, int]] = {}
     captured: dict = {}
@@ -772,7 +819,7 @@ def _kill_previous_crawler_chrome():
     _clear_profile_locks()
 
 
-async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 50, use_boundary: bool = False):
+async def main(city: str, step_km: float | None, delay: float, headless: bool, max_points: int = 0, page_size: int = 100, use_boundary: bool = False):
     city_cfg = CITIES[city]
     points   = generate_city_grid(city, step_km=step_km, use_boundary=use_boundary)
     used_step = step_km if step_km is not None else city_cfg['step_km']
@@ -971,7 +1018,7 @@ if __name__ == '__main__':
     parser.add_argument('--delay',       type=float, default=60.0, help='Delay base entre navegacoes (s)')
     parser.add_argument('--headless',    action='store_true',      help='Rodar sem janela')
     parser.add_argument('--max-points',  type=int,   default=0,    help='Limite de pontos (0 = sem limite)')
-    parser.add_argument('--page-size',   type=int,   default=50,   help='Restaurantes por ponto da grade (default 50)')
+    parser.add_argument('--page-size',   type=int,   default=100,  help='Restaurantes por ponto da grade (default 100)')
     parser.add_argument('--boundary',    action='store_true',      help='Filtrar grade pelo polígono real do município via OSM (requer shapely e requests)')
     args = parser.parse_args()
 
