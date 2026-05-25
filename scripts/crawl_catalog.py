@@ -24,6 +24,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -484,6 +485,71 @@ def load_merchants(files: list[Path]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Skip listener (retry loop)
+# ---------------------------------------------------------------------------
+
+_skip_event = threading.Event()
+
+
+def _start_skip_listener() -> None:
+    def _reader():
+        while True:
+            try:
+                if sys.stdin.readline().strip().lower() == 's':
+                    _skip_event.set()
+            except Exception:
+                break
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+async def _interruptible_sleep(seconds: float) -> bool:
+    """Aguarda até `seconds`. Retorna True se o usuário pediu para pular."""
+    deadline = asyncio.get_event_loop().time() + seconds
+    while asyncio.get_event_loop().time() < deadline:
+        if _skip_event.is_set():
+            _skip_event.clear()
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def _save_catalog_meta(output_dir: Path, merchant_files: list[Path],
+                        delay: float, max_merchants: int, proxy: str | None) -> None:
+    meta = {
+        'merchant_files': [str(f.resolve()) for f in merchant_files],
+        'output_dir':     str(output_dir.resolve()),
+        'delay':          delay,
+        'max_merchants':  max_merchants,
+        'proxy':          proxy,
+        'started_at':     datetime.now().isoformat(),
+    }
+    (output_dir / 'catalog_meta.json').write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8'
+    )
+
+
+def _load_catalog_meta(resume_dir: Path) -> tuple[list[Path], Path, float, int, str | None]:
+    meta_file = resume_dir / 'catalog_meta.json'
+    if not meta_file.exists():
+        raise FileNotFoundError(
+            f'catalog_meta.json não encontrado em {resume_dir}.\n'
+            'Apenas capturas iniciadas após esta versão suportam retomada.'
+        )
+    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+    return (
+        [Path(f) for f in meta['merchant_files']],
+        Path(meta['output_dir']),
+        meta['delay'],
+        meta['max_merchants'],
+        meta.get('proxy'),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -494,6 +560,7 @@ async def main(
     headless: bool,
     max_merchants: int = 0,
     proxy: str | None = None,
+    resuming: bool = False,
 ):
     merchants = load_merchants(merchant_files)
     if not merchants:
@@ -504,15 +571,23 @@ async def main(
         merchants = merchants[:max_merchants]
 
     todo = [m for m in merchants if not is_done(store_folder(output_dir, m['id'], m['name']))]
+    done_count = len(merchants) - len(todo)
 
-    print(f'[*] {len(merchants)} merchants, {len(todo)} sem catálogo')
+    print(f'[*] {len(merchants)} merchants, {len(todo)} sem catálogo'
+          + (f' ({done_count} já feitos)' if done_count else ''))
     if not todo:
         print('[+] Todos os catálogos já foram capturados.')
         return
 
+    if not resuming:
+        _save_catalog_meta(output_dir, merchant_files, delay, max_merchants, proxy)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f'[*] Salvando em: {output_dir}')
-    print(f'[*] Delay: {delay}s (+-20% jitter)\n')
+    print(f'[*] Delay: {delay}s (+-20% jitter)')
+
+    _start_skip_listener()
+    print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular a loja.\n')
 
     _kill_previous_chrome()
     await asyncio.sleep(0.3)
@@ -538,9 +613,9 @@ async def main(
         follow_redirects=True,
     ) as client:
 
-        for i, merchant in enumerate(todo, 1):
+        for i, merchant in enumerate(todo, done_count + 1):
             name_preview = merchant['name'][:50]
-            print(f'[{i:4d}/{len(todo)}] {name_preview}')
+            print(f'[{i:4d}/{len(merchants)}] {name_preview}')
 
             if session.is_expired():
                 print('[*] Renovando sessão (TTL atingido)...')
@@ -549,14 +624,21 @@ async def main(
                 session = await capture_session(headless=headless, proxy=proxy)
                 errors = 0
 
-            result = await fetch_catalog(session, client, merchant)
-
             folder = store_folder(output_dir, merchant['id'], merchant['name'])
 
-            if result is None:
+            # Retry loop — tenta até funcionar ou usuário pular
+            retry   = 0
+            skipped = False
+            result  = None
+            while True:
+                _skip_event.clear()
+                result = await fetch_catalog(session, client, merchant)
+                if result is not None:
+                    errors = 0
+                    break
+
+                retry  += 1
                 errors += 1
-                fail_count += 1
-                print('  -> ERRO (sessão ou rede)')
 
                 if errors >= 3:
                     print(f'[!] {errors} erros consecutivos — renovando sessão...')
@@ -565,35 +647,42 @@ async def main(
                     session = await capture_session(headless=headless, proxy=proxy)
                     errors = 0
 
+                backoff = min(5 * retry, 60)
+                print(f'  [!] Tentativa {retry} falhou — '
+                      f'retentando em {backoff}s... [s + Enter para pular]')
+                skipped = await _interruptible_sleep(backoff)
+                if skipped:
+                    print(f'  [->] {merchant["name"][:50]} pulado manualmente.')
+                    break
+
+            if skipped:
+                fail_count += 1
+
             elif result is _EMPTY:
-                errors = 0
                 empty_count += 1
                 folder.mkdir(parents=True, exist_ok=True)
-                catalog_out = {
-                    'merchant_id':   merchant['id'],
-                    'merchant_name': merchant['name'],
-                    'crawled_at':    datetime.now().isoformat(),
-                    'catalog':       None,
-                }
                 (folder / 'catalog.json').write_text(
-                    json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
+                    json.dumps({
+                        'merchant_id':   merchant['id'],
+                        'merchant_name': merchant['name'],
+                        'crawled_at':    datetime.now().isoformat(),
+                        'catalog':       None,
+                    }, ensure_ascii=False, indent=2), encoding='utf-8'
                 )
                 print('  -> vazio (404 / loja inativa)')
 
             else:
-                errors = 0
                 ok_count += 1
                 folder.mkdir(parents=True, exist_ok=True)
 
-                catalog_out = {
-                    'merchant_id':   merchant['id'],
-                    'merchant_name': merchant['name'],
-                    'merchant_link': merchant.get('link', ''),
-                    'crawled_at':    datetime.now().isoformat(),
-                    'catalog':       result,
-                }
                 (folder / 'catalog.json').write_text(
-                    json.dumps(catalog_out, ensure_ascii=False, indent=2), encoding='utf-8'
+                    json.dumps({
+                        'merchant_id':   merchant['id'],
+                        'merchant_name': merchant['name'],
+                        'merchant_link': merchant.get('link', ''),
+                        'crawled_at':    datetime.now().isoformat(),
+                        'catalog':       result,
+                    }, ensure_ascii=False, indent=2), encoding='utf-8'
                 )
 
                 products = extract_products(result)
@@ -625,22 +714,35 @@ if __name__ == '__main__':
     parser.add_argument('--headless', action='store_true',       help='Rodar sem janela')
     parser.add_argument('--max',      type=int,   default=0,     help='Máx N lojas (0 = todas)')
     parser.add_argument('--proxy',    default=None,              help='Proxy HTTP/SOCKS5')
+    parser.add_argument('--resume',   type=Path,  default=None, metavar='DIR',
+                        help='Retoma uma captura de catálogos anterior a partir do diretório informado')
     args = parser.parse_args()
 
-    if args.capture_dir:
+    if args.resume:
+        if not args.resume.exists():
+            print(f'[!] Diretório não encontrado: {args.resume}')
+            sys.exit(1)
+        merchant_files, output_dir, delay, max_merchants, proxy = _load_catalog_meta(args.resume)
+        print(f'[*] Retomando catálogo: {args.resume}')
+        uc.loop().run_until_complete(
+            main(merchant_files, output_dir, delay, args.headless, max_merchants, proxy, resuming=True)
+        )
+    elif args.capture_dir:
         merchants_file = args.capture_dir / 'merchants.jsonl'
         if not merchants_file.exists():
             print(f'[!] {merchants_file} não encontrado.')
             sys.exit(1)
         output_dir     = args.capture_dir
         merchant_files = [merchants_file]
+        uc.loop().run_until_complete(
+            main(merchant_files, output_dir, args.delay, args.headless, args.max, args.proxy)
+        )
     elif args.merchants:
         merchant_files = args.merchants
         output_dir     = args.out if args.out else merchant_files[0].parent
         output_dir.mkdir(parents=True, exist_ok=True)
+        uc.loop().run_until_complete(
+            main(merchant_files, output_dir, args.delay, args.headless, args.max, args.proxy)
+        )
     else:
-        parser.error('Especifique --capture-dir PATH ou passe arquivos merchants.jsonl')
-
-    uc.loop().run_until_complete(
-        main(merchant_files, output_dir, args.delay, args.headless, args.max, args.proxy)
-    )
+        parser.error('Especifique --resume DIR, --capture-dir PATH ou passe arquivos merchants.jsonl')
