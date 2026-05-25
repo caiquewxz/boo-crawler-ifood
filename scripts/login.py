@@ -110,7 +110,12 @@ async def main():
     print('=' * 60)
     input()
 
-    all_cookies = await tab.send(cdp.network.get_all_cookies())
+    # get_all_cookies() está depreciado no nodriver 1.3+ — usar get_cookies(urls=[...])
+    all_cookies = await tab.send(cdp.network.get_cookies(urls=[
+        f'https://{IFOOD_HOST}',
+        'https://www.ifood.com.br',
+        'https://ifood.com.br',
+    ]))
     ifood_cookies = [
         {
             'name':     c.name,
@@ -123,18 +128,36 @@ async def main():
             'expires':  c.expires if c.expires and c.expires > 0 else -1,
         }
         for c in all_cookies
-        if IFOOD_HOST in (c.domain or '')
+        if IFOOD_HOST in (c.domain or '') or 'ifood.com.br' in (c.domain or '')
     ]
 
     session = {'cookies': ifood_cookies, 'origins': []}
     SESSION_FILE.write_text(json.dumps(session, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'[+] Sessao salva: {len(ifood_cookies)} cookies em {SESSION_FILE}')
+    print(f'[+] {len(ifood_cookies)} cookies salvos em {SESSION_FILE}')
 
+    # Diagnóstico — mostra quais tokens de auth foram encontrados
+    auth_cookies = {'aAccessToken', 'aRefreshToken', 'aAccountId', 'aDeviceId'}
+    found = {c['name'] for c in ifood_cookies if c['name'] in auth_cookies}
+    missing = auth_cookies - found
+    if 'aAccessToken' in found:
+        print('[+] aAccessToken encontrado — sessao valida.')
+    else:
+        print('[!] aAccessToken NAO encontrado.')
+        print('    Possiveis causas:')
+        print('    1. Voce nao fez login (ainda esta na tela inicial sem conta)')
+        print('    2. O iFood bloqueou o login (verificacao de bot na pagina de login)')
+        print('    3. O token esta sob outro dominio — tente pressionar Enter')
+        print('       depois de navegar para ifood.com.br/restaurantes logado.')
+    if missing - {'aAccessToken'}:
+        print(f'[*] Cookies ausentes: {", ".join(sorted(missing))}')
+
+    # Aguarda o Chrome salvar cookies no disco antes de fechar
+    await asyncio.sleep(1.5)
     try:
         browser.stop()
     except Exception:
         pass
-    _stop_our_chrome(browser_pid)
+    await asyncio.sleep(0.5)
     _clear_profile_locks()
 
 

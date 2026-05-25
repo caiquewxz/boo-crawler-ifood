@@ -292,15 +292,27 @@ async def capture_session(headless: bool = False, proxy: str | None = None) -> S
 
     # Aguarda sessao valida
     print('[*] Verificando sessao...')
-    await tab.get(HOME_URL)
-    deadline = asyncio.get_event_loop().time() + 20.0
-    while asyncio.get_event_loop().time() < deadline:
-        cookies = await tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}']))
+    try:
+        await asyncio.wait_for(tab.get(HOME_URL), timeout=30.0)
+    except asyncio.TimeoutError:
+        print('[*] Timeout na navegacao — verificando cookies mesmo assim...')
+
+    token_found = False
+    for _attempt in range(10):  # max 10 × 2s = 20s
+        try:
+            cookies = await asyncio.wait_for(
+                tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}'])),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            cookies = []
         if any(c.name == 'aAccessToken' and c.value for c in cookies):
+            token_found = True
             break
         print('[*] Aguardando token...')
         await asyncio.sleep(2.0)
-    else:
+
+    if not token_found:
         try:
             browser.stop()
         except Exception:

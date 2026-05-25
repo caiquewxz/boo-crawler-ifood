@@ -998,14 +998,22 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool,
 
     # Verifica sessao — espera ate 15s para aAccessToken ser renovado automaticamente
     print('[*] Verificando sessao...')
-    await tab.get(HOME_URL)
+    try:
+        await asyncio.wait_for(tab.get(HOME_URL), timeout=30.0)
+    except asyncio.TimeoutError:
+        print('[*] Timeout na navegacao — verificando cookies mesmo assim...')
     if await is_challenge_present(tab):
         await handle_challenge(tab)
 
     logged_in = False
-    deadline = asyncio.get_event_loop().time() + 15.0
-    while asyncio.get_event_loop().time() < deadline:
-        cookies = await tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}']))
+    for _attempt in range(8):  # max 8 × 2s = 16s
+        try:
+            cookies = await asyncio.wait_for(
+                tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}'])),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            cookies = []
         if any(c.name == 'aAccessToken' and c.value for c in cookies):
             logged_in = True
             break
