@@ -383,8 +383,7 @@ async def capture_session(headless: bool = False, proxy: str | None = None) -> S
         '--no-default-browser-check',
         '--exclude-switches=enable-automation',
         '--disable-infobars',
-        '--window-size=1920,1080',
-        '--window-position=9999,9999',
+        '--window-size=1280,900',
     ]
     if proxy:
         chrome_args.append(f'--proxy-server={proxy}')
