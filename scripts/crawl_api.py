@@ -31,6 +31,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -60,6 +61,35 @@ EXCLUDED_URL_PARTS = [
     'payment', 'profile', 'address', 'voucher', 'loyalty',
     'cached', 'default',
 ]
+
+# ---------------------------------------------------------------------------
+# Skip listener — digitar "s" + Enter pula o ponto atual em caso de erro
+# ---------------------------------------------------------------------------
+
+_skip_event = threading.Event()
+
+
+def _start_skip_listener() -> None:
+    def _reader():
+        while True:
+            try:
+                if sys.stdin.readline().strip().lower() == 's':
+                    _skip_event.set()
+            except Exception:
+                break
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+async def _interruptible_sleep(seconds: float) -> bool:
+    """Aguarda até `seconds`. Retorna True se o usuário pediu para pular."""
+    deadline = asyncio.get_event_loop().time() + seconds
+    while asyncio.get_event_loop().time() < deadline:
+        if _skip_event.is_set():
+            _skip_event.clear()
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
 
 STEALTH_SCRIPT = r"""
 (function() {
@@ -584,6 +614,9 @@ async def main(
 
     session = await capture_session(headless=headless, proxy=proxy)
 
+    _start_skip_listener()
+    print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular o ponto atual.\n')
+
     seen_ids  = set()
     total_new = 0
     errors    = 0
@@ -615,13 +648,20 @@ async def main(
                     session = await capture_session(headless=headless, proxy=proxy)
                     errors  = 0
 
-                all_here = await fetch_all_pages(session, client, lat, lon, page_size)
+                # Retry loop — tenta até funcionar ou usuário pular
+                retry    = 0
+                skipped  = False
+                all_here = None
+                while True:
+                    _skip_event.clear()
+                    all_here = await fetch_all_pages(session, client, lat, lon, page_size)
+                    if all_here is not None:
+                        errors = 0
+                        break
 
-                if all_here is None:
+                    retry  += 1
                     errors += 1
-                    line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) ERRO'
 
-                    # Token expirado ou muitos erros consecutivos — renova sessao
                     if errors >= 3:
                         msg = f'[!] {errors} erros consecutivos — renovando sessao...'
                         print(msg); lf.write(msg + '\n'); lf.flush()
@@ -630,14 +670,26 @@ async def main(
                         session = await capture_session(headless=headless, proxy=proxy)
                         errors  = 0
 
+                    backoff = min(5 * retry, 60)
+                    msg = (f'  [!] Tentativa {retry} falhou — '
+                           f'retentando em {backoff}s... [s + Enter para pular]')
+                    print(msg); lf.write(msg + '\n'); lf.flush()
+                    skipped = await _interruptible_sleep(backoff)
+                    if skipped:
+                        msg = f'  [->] Ponto ({lat:.4f},{lon:.4f}) pulado manualmente.'
+                        print(msg); lf.write(msg + '\n'); lf.flush()
+                        break
+
+                if skipped:
+                    line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) PULADO'
                     pf.write(json.dumps({
                         'index': i, 'lat': lat, 'lon': lon,
-                        'count': 0, 'total': total_new, 'names': [], 'error': True,
+                        'count': 0, 'total': total_new, 'names': [],
+                        'error': True, 'skipped': True,
                     }, ensure_ascii=False) + '\n')
                     pf.flush()
 
                 else:
-                    errors   = 0
                     new_here = filter_new(all_here, seen_ids)
                     total_new += len(new_here)
 

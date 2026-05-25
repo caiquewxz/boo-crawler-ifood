@@ -32,6 +32,7 @@ import random
 import re
 import subprocess
 import sys
+import threading
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +47,35 @@ HOME_URL       = 'https://www.ifood.com.br/restaurantes'
 IFOOD_HOST     = 'www.ifood.com.br'
 CHROME_PROFILE = Path(__file__).parent.parent / '.chrome-profile'
 _PID_FILE      = CHROME_PROFILE / '.crawler_pid'
+
+# ---------------------------------------------------------------------------
+# Skip listener — digitar "s" + Enter pula o ponto atual em caso de erro
+# ---------------------------------------------------------------------------
+
+_skip_event = threading.Event()
+
+
+def _start_skip_listener() -> None:
+    def _reader():
+        while True:
+            try:
+                if sys.stdin.readline().strip().lower() == 's':
+                    _skip_event.set()
+            except Exception:
+                break
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+async def _interruptible_sleep(seconds: float) -> bool:
+    """Aguarda até `seconds`. Retorna True se o usuário pediu para pular."""
+    deadline = asyncio.get_event_loop().time() + seconds
+    while asyncio.get_event_loop().time() < deadline:
+        if _skip_event.is_set():
+            _skip_event.clear()
+            return True
+        await asyncio.sleep(0.2)
+    return False
+
 
 # Intercepta o fetch() natural do iFood para capturar method + headers + body
 # do request bm/home, que e um POST com Authorization JWT.
@@ -920,6 +950,8 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
     print('[+] Aquecimento concluido. Iniciando crawl.')
     print(f'[*] Salvando em: {out_dir}')
     print(f'[*] Delay base: {delay}s (+-20% jitter)\n')
+    _start_skip_listener()
+    print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular o ponto atual.\n')
 
     with open(jsonl_path,     'w', encoding='utf-8') as jf, \
          open(merchants_path, 'w', encoding='utf-8') as mf, \
@@ -931,13 +963,40 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
         lf.write(f'Pontos: {len(points)}\n\n')
 
         for i, (lat, lon) in enumerate(points, 1):
-            try:
-                await natural_browse(tab)
-                result = await crawl_point(tab, lat, lon, page_size=page_size)
+            # Retry loop — tenta até funcionar ou usuário pular
+            retry   = 0
+            skipped = False
+            result  = None
+            while True:
+                _skip_event.clear()
+                try:
+                    await natural_browse(tab)
+                    result = await crawl_point(tab, lat, lon, page_size=page_size)
+                    if result is None:
+                        raise Exception('nenhuma chamada API (timeout)')
+                    break  # sucesso
+                except Exception as e:
+                    retry  += 1
+                    backoff = min(10 * retry, 90)
+                    msg = (f'  [!] Tentativa {retry} — {e} — '
+                           f'retentando em {backoff}s... [s + Enter para pular]')
+                    print(msg); lf.write(msg + '\n'); lf.flush()
+                    skipped = await _interruptible_sleep(backoff)
+                    if skipped:
+                        msg = f'  [->] Ponto ({lat:.4f},{lon:.4f}) pulado manualmente.'
+                        print(msg); lf.write(msg + '\n'); lf.flush()
+                        break
 
-                if result is None:
-                    raise Exception('nenhuma chamada API (timeout)')
+            if skipped:
+                line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) PULADO'
+                pf.write(json.dumps({
+                    'index': i, 'lat': lat, 'lon': lon,
+                    'count': 0, 'total': total_new, 'names': [],
+                    'error': True, 'skipped': True,
+                }, ensure_ascii=False) + '\n')
+                pf.flush()
 
+            else:
                 if detected_api is None and result.get('api_url'):
                     detected_api = result['api_url'].split('?')[0]
                     msg = f'[+] Endpoint detectado: {detected_api}'
@@ -970,14 +1029,6 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool, m
                     preview = ', '.join(m['name'] for m in new_here[:3])
                     extra   = f' (+{len(new_here)-3})' if len(new_here) > 3 else ''
                     line   += f'\n  -> {preview}{extra}'
-
-            except Exception as e:
-                pf.write(json.dumps({
-                    'index': i, 'lat': lat, 'lon': lon,
-                    'count': 0, 'total': total_new, 'names': [], 'error': True,
-                }, ensure_ascii=False) + '\n')
-                pf.flush()
-                line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) ERRO: {e}'
 
             print(line); lf.write(line + '\n'); lf.flush()
             wait = delay * random.uniform(0.8, 1.2)
