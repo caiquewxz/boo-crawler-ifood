@@ -113,6 +113,15 @@ CITIES: dict[str, dict] = {
         "step_km": 2.0,   # ~36 pontos — zona urbana real (calibrado pelo log 2026-05-22)
         "osm_query": "São João del Rei, MG, Brazil",
     },
+    "ribeirao-preto": {
+        "name": "Ribeirão Preto - SP",
+        "lat_min": -21.280,
+        "lat_max": -21.090,
+        "lon_min": -47.950,
+        "lon_max": -47.740,
+        "step_km": 3.0,   # ~70 pontos
+        "osm_query": "Ribeirão Preto, SP, Brazil",
+    },
 }
 
 

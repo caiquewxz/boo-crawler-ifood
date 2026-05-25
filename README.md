@@ -258,6 +258,7 @@ Depois fecha o browser. Todos os requests seguintes são httpx puro, sem browser
 | `manaus` | Manaus - AM | 5.0 km | ~80 |
 | `recife` | Recife - PE | 3.0 km | ~80 |
 | `sao-joao-del-rei` | São João del Rei - MG | 2.0 km | ~36 |
+| `ribeirao-preto` | Ribeirão Preto - SP | 3.0 km | ~64 |
 
 ---
 
