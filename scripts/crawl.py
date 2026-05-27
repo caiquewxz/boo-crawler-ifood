@@ -321,6 +321,67 @@ STEALTH_SCRIPT = r"""
         _mark(Element.prototype.getAttribute, Element.prototype.getAttribute);
         _mark(Function.prototype.toString, _nativeToStr);
     } catch(e) {}
+
+    // --- Akamai Bot Manager specific vectors ---
+
+    // navigator.userActivation — CDP sessions lack user activation; Akamai checks this
+    try {
+        Object.defineProperty(Navigator.prototype, 'userActivation', {
+            get: () => ({hasBeenActive: true, isActive: true}),
+            configurable: true,
+        });
+    } catch(e) {}
+
+    // document.hasFocus — CDP windows may return false; Akamai holds button check uses this
+    try {
+        Document.prototype.hasFocus = function() { return true; };
+    } catch(e) {}
+
+    // Page visibility — Akamai sensor checks document.hidden and visibilityState
+    try {
+        Object.defineProperty(Document.prototype, 'visibilityState', {
+            get: () => 'visible', configurable: true,
+        });
+        Object.defineProperty(Document.prototype, 'hidden', {
+            get: () => false, configurable: true,
+        });
+    } catch(e) {}
+
+    // devicePixelRatio — 0 ou 1 em sessoes headless/CDP; laptops normais retornam 2
+    try {
+        Object.defineProperty(window, 'devicePixelRatio', {
+            get: () => 2, configurable: true,
+        });
+    } catch(e) {}
+
+    // outerWidth/outerHeight — CDP reporta 0 antes do layout; patch para valores realistas
+    try {
+        Object.defineProperty(window, 'outerWidth',  {get: () => 1280, configurable: true});
+        Object.defineProperty(window, 'outerHeight', {get: () => 900,  configurable: true});
+        Object.defineProperty(window, 'innerWidth',  {get: () => 1280, configurable: true});
+        Object.defineProperty(window, 'innerHeight', {get: () => 900,  configurable: true});
+    } catch(e) {}
+
+    // Intercepta coleta do sensor Akamai — apaga campos que expem CDP (sem quebrar o envio)
+    try {
+        const _origSend = XMLHttpRequest.prototype.send;
+        XMLHttpRequest.prototype.send = function(body) {
+            if (typeof body === 'string' && body.indexOf('sensor_data') !== -1) {
+                try {
+                    var obj = JSON.parse(body);
+                    // Remove campos de fingerprint CDP se presentes
+                    if (obj.sensor_data) {
+                        // sensor_data e uma string base64/encoded — nao modificamos o conteudo
+                        // mas garantimos que nao ha campos extras de automacao
+                        delete obj.automation;
+                        delete obj.webdriver;
+                        body = JSON.stringify(obj);
+                    }
+                } catch(e2) {}
+            }
+            return _origSend.call(this, body);
+        };
+    } catch(e) {}
 })();
 """
 
@@ -436,20 +497,74 @@ async def set_location_cookies(tab, lat: float, lon: float):
 # Deteccao e resolucao de desafio Akamai
 # ---------------------------------------------------------------------------
 
+# Selectors que cobrem variantes conhecidas do challenge Akamai (WRA / Bot Manager)
+_CHALLENGE_SELECTORS = [
+    'iframe[src*="wra-api"]',
+    'iframe[src*="akam"]',
+    'iframe[src*="bm/fl"]',
+    'iframe[src*="_sec/cp_challenge"]',
+    'div[id*="ak-challenge"]',
+    'form[action*="/_sec/cp_challenge"]',
+]
+
+_CHALLENGE_URLS = ['challenge', 'access-denied', 'errors.edgesuite', 'akamaierror', '/blocked']
+
+_CHALLENGE_SELECTOR_JS = (
+    '!!document.querySelector('
+    + repr(','.join(_CHALLENGE_SELECTORS))
+    + ')'
+)
+
+
+async def log_abck_state(tab) -> str:
+    """Loga o estado do cookie _abck para diagnostico de deteccao Akamai.
+    Retorna 'flagged', 'clean' ou 'absent'."""
+    try:
+        cookies = await asyncio.wait_for(
+            tab.send(cdp.network.get_cookies(urls=[f'https://{IFOOD_HOST}'])),
+            timeout=5.0,
+        )
+    except Exception:
+        return 'absent'
+    abck = next((c for c in cookies if c.name == '_abck'), None)
+    if not abck or not abck.value:
+        print('[abck] cookie ausente — sessao nova ou bloqueada')
+        return 'absent'
+    val = abck.value
+    # _abck encodes: <data>~<version>~<timestamp>~<more>
+    # Um bot_score de -1 no final indica sessao flagged pela Akamai
+    flagged = '~-1~' in val or val.endswith('~-1')
+    short   = len(val) < 80   # cookie muito curto = rejeitado antes de acumular dados
+    status  = 'flagged' if (flagged or short) else 'clean'
+    indicator = 'BOT-FLAGGED' if status == 'flagged' else 'clean'
+    print(f'[abck] {indicator} | len={len(val)} | {val[:70]}...')
+    return status
+
+
 async def is_challenge_present(tab) -> bool:
     url = tab.url or ''
-    if any(x in url.lower() for x in ['challenge', '/entrar', 'access-denied', 'errors.edgesuite']):
+    if any(x in url.lower() for x in _CHALLENGE_URLS):
         return True
-    return bool(await tab.evaluate('!!document.querySelector(\'iframe[src*="wra-api"]\')'))
+    try:
+        return bool(await asyncio.wait_for(tab.evaluate(_CHALLENGE_SELECTOR_JS), timeout=3.0))
+    except Exception:
+        return False
 
 
 async def try_auto_hold(tab) -> bool:
-    rect = await tab.evaluate("""(() => {
-        const el = document.querySelector('iframe[src*="wra-api"]');
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return {cx: r.left + r.width/2, cy: r.top + r.height/2};
-    })()""")
+    selector_js = (
+        "(() => {"
+        "  const sel = " + repr(','.join(_CHALLENGE_SELECTORS)) + ";"
+        "  const el = document.querySelector(sel);"
+        "  if (!el) return null;"
+        "  const r = el.getBoundingClientRect();"
+        "  return {cx: r.left + r.width/2, cy: r.top + r.height/2};"
+        "})()"
+    )
+    try:
+        rect = await asyncio.wait_for(tab.evaluate(selector_js), timeout=5.0)
+    except Exception:
+        return False
     if not rect:
         return False
     cx, cy = float(rect['cx']), float(rect['cy'])
@@ -458,33 +573,49 @@ async def try_auto_hold(tab) -> bool:
     await tab.send(cdp.input_.dispatch_mouse_event(
         type_='mousePressed', x=cx, y=cy, button=cdp.input_.MouseButton.LEFT, click_count=1,
     ))
-    for _ in range(int(random.uniform(5.0, 7.0) / 0.25)):
+    hold_secs = random.uniform(6.0, 9.0)
+    steps = int(hold_secs / 0.05)
+    for _ in range(steps):
         await tab.send(cdp.input_.dispatch_mouse_event(
-            type_='mouseMoved', x=cx+random.uniform(-2,2), y=cy+random.uniform(-2,2),
+            type_='mouseMoved', x=cx+random.uniform(-1.5, 1.5), y=cy+random.uniform(-1.5, 1.5),
         ))
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.05)
     await tab.send(cdp.input_.dispatch_mouse_event(
         type_='mouseReleased', x=cx, y=cy, button=cdp.input_.MouseButton.LEFT, click_count=1,
     ))
-    await asyncio.sleep(2.0)
-    print('[*] Desafio: hold simulado no iframe wra-api')
+    await asyncio.sleep(2.5)
+    print(f'[*] Desafio: hold simulado ({hold_secs:.1f}s) no elemento challenge')
     return True
 
 
-async def handle_challenge(tab, manual_timeout: int = 120) -> bool:
+async def handle_challenge(tab, manual_timeout: int = 300) -> bool:
     if not await is_challenge_present(tab):
         return True
-    print(f'\n[!] Desafio detectado: {tab.url}')
+    print(f'\n[!] Desafio Akamai detectado: {tab.url}')
+
+    # Diagnoastico do _abck ANTES de tentar resolver
+    abck_status = await log_abck_state(tab)
+    if abck_status == 'flagged':
+        print('[!] _abck ja esta BOT-FLAGGED — hold provavelmente nao vai passar.')
+        print('[!] Aguarde: o sensor Akamai precisa de ~30s de comportamento humano')
+        print('[!] para renovar o cookie. Movimente o mouse na janela do Chrome.')
+        # Aguarda sensor re-avaliar antes de tentar o hold
+        await asyncio.sleep(30.0)
+
     if await try_auto_hold(tab):
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         if not await is_challenge_present(tab):
             print('[+] Desafio resolvido automaticamente.')
+            await log_abck_state(tab)
             return True
+
     print(f'[!] Automacao falhou — resolva manualmente no browser ({manual_timeout}s)...')
+    print('[!] DICA: se o hold nao funcionar, aguarde ~30s movendo o mouse e tente de novo.')
     deadline = asyncio.get_event_loop().time() + manual_timeout
     while asyncio.get_event_loop().time() < deadline:
         if not await is_challenge_present(tab):
             print('[+] Desafio resolvido manualmente.')
+            await log_abck_state(tab)
             return True
         await asyncio.sleep(1)
     print('[!] Timeout aguardando resolucao.')
@@ -1117,6 +1248,7 @@ async def main(city: str, step_km: float | None, delay: float, headless: bool,
         await asyncio.wait_for(tab.get(HOME_URL), timeout=30.0)
     except asyncio.TimeoutError:
         print('[*] Timeout na navegacao — verificando cookies mesmo assim...')
+    await log_abck_state(tab)   # diagnostico: mostra se sessao ja esta flagged pre-challenge
     if await is_challenge_present(tab):
         await handle_challenge(tab)
 
