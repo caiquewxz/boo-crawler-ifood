@@ -39,7 +39,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -65,6 +65,62 @@ EXCLUDED_URL_PARTS = [
     'payment', 'profile', 'address', 'voucher', 'loyalty',
     'cached', 'default',
 ]
+
+# ---------------------------------------------------------------------------
+# Tinybird — envio em tempo real
+# ---------------------------------------------------------------------------
+
+_TB_URL     = 'https://api.us-east.aws.tinybird.co/v0/events?name=ifood_events'
+_TB_TOKEN   = (
+    'p.eyJ1IjogIjU5OGY3MTRhLWZkMjgtNDMzNi05MTYyLTliN2JjMWZmZThiNCIsICJpZCI6ICI4Mzk3'
+    'YjExNy02MTJlLTRiYjUtOWIzYS01NTZhNzMyMjU0YmMiLCAiaG9zdCI6ICJ1cy1lYXN0LWF3cyJ9'
+    '.g6seexnBh2LfwsI_1fUViLiAmG59tZ2FLuuyPE6Zfxk'
+)
+_TB_HEADERS = {
+    'Authorization': f'Bearer {_TB_TOKEN}',
+    'Content-Type': 'application/json',
+}
+
+
+async def _tb_send(client: httpx.AsyncClient, events: list[dict]) -> None:
+    """Envia eventos para o Tinybird (NDJSON). Silencia erros para nao travar o crawl."""
+    if not events:
+        return
+    ndjson = '\n'.join(json.dumps(e, ensure_ascii=False) for e in events)
+    try:
+        resp = await client.post(
+            _TB_URL, headers=_TB_HEADERS,
+            content=ndjson.encode('utf-8'), timeout=15.0,
+        )
+        if resp.status_code not in (200, 202):
+            print(f'[tb] HTTP {resp.status_code}: {resp.text[:100]}')
+    except Exception as e:
+        print(f'[tb] erro: {e}')
+
+
+def _tb_api_request(
+    request_url: str,
+    request_method: str,
+    request_body: str,
+    request_headers: dict,
+    response_status_code: int,
+    response_headers: dict,
+    response_body: str,
+) -> dict:
+    return {
+        'event_type': 'api_request',
+        'device_id':  'browser',
+        'event_data': json.dumps({
+            'request_url':          request_url,
+            'request_method':       request_method,
+            'request_body':         request_body,
+            'request_headers':      request_headers,
+            'response_status_code': response_status_code,
+            'response_headers':     response_headers,
+            'response_body':        response_body,
+        }, ensure_ascii=False),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Skip listener — digitar "s" + Enter pula o ponto atual em caso de erro
@@ -535,14 +591,23 @@ async def fetch_point(
     lat: float,
     lon: float,
     page_size: int,
+    tb: httpx.AsyncClient | None = None,
 ) -> dict | None:
-    url = session.build_url(lat, lon, page_size)
+    url    = session.build_url(lat, lon, page_size)
+    method = 'POST' if session.post_body else 'GET'
     try:
         if session.post_body:
             resp = await client.post(url, content=session.post_body,
                                      headers=session.headers, cookies=session.cookies)
         else:
             resp = await client.get(url, headers=session.headers, cookies=session.cookies)
+
+        if tb is not None:
+            await _tb_send(tb, [_tb_api_request(
+                url, method, session.post_body or '',
+                session.headers, resp.status_code,
+                dict(resp.headers), resp.text,
+            )])
 
         if resp.status_code in (401, 403):
             # 401 = aAccessToken expirado; 403 = _px3 inválido/ausente (HUMAN Security)
@@ -655,14 +720,14 @@ async def fetch_all_pages(
     lat: float,
     lon: float,
     page_size: int,
+    tb: httpx.AsyncClient | None = None,
 ) -> list[dict] | None:
     """Busca todos os restaurantes de um ponto paginando o 'ver mais'.
 
     Retorna None em caso de falha de auth/rede (sinaliza renovação de sessão).
     Retorna lista vazia se o ponto não tem cobertura.
     """
-    # Página inicial
-    data = await fetch_point(session, client, lat, lon, page_size)
+    data = await fetch_point(session, client, lat, lon, page_size, tb=tb)
     if data is None:
         return None
 
@@ -672,13 +737,21 @@ async def fetch_all_pages(
     page_num = 1
     while cursor and section_id:
         page_num += 1
-        url = session.build_paginated_url(lat, lon, section_id, cursor, alias)
+        url    = session.build_paginated_url(lat, lon, section_id, cursor, alias)
+        method = 'POST' if session.post_body else 'GET'
         try:
             if session.post_body:
                 resp = await client.post(url, content=session.post_body,
                                          headers=session.headers, cookies=session.cookies)
             else:
                 resp = await client.get(url, headers=session.headers, cookies=session.cookies)
+
+            if tb is not None:
+                await _tb_send(tb, [_tb_api_request(
+                    url, method, session.post_body or '',
+                    session.headers, resp.status_code,
+                    dict(resp.headers), resp.text,
+                )])
 
             if resp.status_code in (401, 403):
                 print(f'  [pag] HTTP {resp.status_code} na pág {page_num} — sessao invalida')
@@ -690,7 +763,7 @@ async def fetch_all_pages(
             page_data = resp.json()
             page_merchants = extract_merchants(page_data)
             if not page_merchants:
-                break  # sem mais resultados
+                break
 
             all_merchants.extend(page_merchants)
             cursor, _, _ = _extract_pagination(page_data)
@@ -712,35 +785,13 @@ def filter_new(merchants: list[dict], seen: set) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Resume helpers
+# Resume — leitura somente (sem escrita local)
 # ---------------------------------------------------------------------------
 
-def _save_meta(out_dir: Path, city: str, step_km: float, delay: float,
-               page_size: int, use_boundary: bool, proxy: str | None) -> None:
-    meta = {
-        'city': city, 'step_km': step_km, 'delay': delay,
-        'page_size': page_size, 'boundary': use_boundary,
-        'proxy': proxy, 'started_at': datetime.now().isoformat(),
-    }
-    (out_dir / 'crawl_meta.json').write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8'
-    )
-
-
 def _load_resume_state(resume_dir: Path) -> tuple[str, float, float, int, bool, str | None, set, set, int]:
-    """
-    Lê crawl_meta.json + points.jsonl + merchants.jsonl de uma captura anterior.
-
-    Retorna (city, step_km, delay, page_size, boundary, proxy,
-             done_coords, seen_ids, total_new).
-    done_coords: set de (lat, lon) já processados (sucesso ou pulado).
-    """
     meta_file = resume_dir / 'crawl_meta.json'
     if not meta_file.exists():
-        raise FileNotFoundError(
-            f'crawl_meta.json não encontrado em {resume_dir}.\n'
-            'Apenas capturas iniciadas após esta versão suportam retomada.'
-        )
+        raise FileNotFoundError(f'crawl_meta.json não encontrado em {resume_dir}.')
     meta = json.loads(meta_file.read_text(encoding='utf-8'))
 
     done_coords: set[tuple[float, float]] = set()
@@ -795,14 +846,11 @@ async def main(
     proxy: str | None = None,
     resume_dir: Path | None = None,
 ):
-    # --- resume: carrega estado anterior e sobrescreve parâmetros ---
     done_coords: set[tuple[float, float]] = set()
-    resuming = resume_dir is not None
-    if resuming:
+    if resume_dir is not None:
         print(f'[*] Retomando captura: {resume_dir}')
         city, step_km, delay, page_size, use_boundary, proxy, \
             done_coords, seen_ids, total_new = _load_resume_state(resume_dir)
-        out_dir = resume_dir
         print(f'[*] {len(done_coords)} pontos já processados, {total_new} merchants carregados.')
     else:
         seen_ids  = set()
@@ -818,23 +866,11 @@ async def main(
 
     print(f'[*] Cidade: {city_cfg["name"]}')
     print(f'[*] Grade {used_step} km: {len(points)} pontos ({len(pending)} pendentes)')
-    print(f'[*] Delay: {delay}s (+-20% jitter)')
-
-    if not resuming:
-        ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
-        out_dir = Path(__file__).parent.parent / 'captures' / f'crawl_api_{city}_{ts}'
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _save_meta(out_dir, city, used_step, delay, page_size, use_boundary, proxy)
-
-    merchants_path = out_dir / 'merchants.jsonl'
-    log_path       = out_dir / 'crawl.log'
-    points_path    = out_dir / 'points.jsonl'
+    print(f'[*] Delay: {delay}s (+-20% jitter)\n')
 
     if not pending:
         print('[+] Todos os pontos já foram processados.')
         return
-
-    print(f'[*] Salvando em: {out_dir}\n')
 
     _kill_previous_chrome()
     await asyncio.sleep(0.3)
@@ -845,113 +881,69 @@ async def main(
     _start_skip_listener()
     print('[*] Em caso de erro: aguarda e retenta. Digite "s" + Enter para pular o ponto atual.\n')
 
-    errors    = 0
+    errors = 0
 
     transport = httpx.AsyncHTTPTransport(retries=2)
     timeout   = httpx.Timeout(20.0, connect=10.0)
-
-    file_mode = 'a' if resuming else 'w'
 
     async with httpx.AsyncClient(
         transport=transport,
         timeout=timeout,
         follow_redirects=True,
-    ) as client:
+    ) as client, httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as tb:
 
-        with open(merchants_path, file_mode, encoding='utf-8') as mf, \
-             open(log_path,       file_mode, encoding='utf-8') as lf, \
-             open(points_path,    file_mode, encoding='utf-8') as pf:
+        for i, (lat, lon) in enumerate(pending, len(done_coords) + 1):
+            if session.is_expired():
+                print('[*] Renovando sessao (TTL atingido)...')
+                _kill_previous_chrome()
+                await asyncio.sleep(0.3)
+                session = await capture_session(headless=headless, proxy=proxy)
+                errors  = 0
 
-            if resuming:
-                lf.write(f'\n--- Retomada: {datetime.now()} ({len(pending)} pontos pendentes) ---\n\n')
-            else:
-                lf.write(f'Cidade: {city_cfg["name"]}\n')
-                lf.write(f'Inicio: {datetime.now()}\n')
-                lf.write(f'Pontos: {len(points)}\n\n')
+            retry    = 0
+            skipped  = False
+            all_here = None
+            while True:
+                _skip_event.clear()
+                all_here = await fetch_all_pages(session, client, lat, lon, page_size, tb=tb)
+                if all_here is not None:
+                    errors = 0
+                    break
 
-            for i, (lat, lon) in enumerate(pending, len(done_coords) + 1):
-                # Renova sessao proativamente se expirou
-                if session.is_expired():
-                    msg = '[*] Renovando sessao (TTL atingido)...'
-                    print(msg); lf.write(msg + '\n'); lf.flush()
+                retry  += 1
+                errors += 1
+
+                if errors >= 3:
+                    print(f'[!] {errors} erros consecutivos — renovando sessao...')
                     _kill_previous_chrome()
                     await asyncio.sleep(0.3)
                     session = await capture_session(headless=headless, proxy=proxy)
                     errors  = 0
 
-                # Retry loop — tenta até funcionar ou usuário pular
-                retry    = 0
-                skipped  = False
-                all_here = None
-                while True:
-                    _skip_event.clear()
-                    all_here = await fetch_all_pages(session, client, lat, lon, page_size)
-                    if all_here is not None:
-                        errors = 0
-                        break
-
-                    retry  += 1
-                    errors += 1
-
-                    if errors >= 3:
-                        msg = f'[!] {errors} erros consecutivos — renovando sessao...'
-                        print(msg); lf.write(msg + '\n'); lf.flush()
-                        _kill_previous_chrome()
-                        await asyncio.sleep(0.3)
-                        session = await capture_session(headless=headless, proxy=proxy)
-                        errors  = 0
-
-                    backoff = min(5 * retry, 60)
-                    msg = (f'  [!] Tentativa {retry} falhou — '
-                           f'retentando em {backoff}s... [s + Enter para pular]')
-                    print(msg); lf.write(msg + '\n'); lf.flush()
-                    skipped = await _interruptible_sleep(backoff)
-                    if skipped:
-                        msg = f'  [->] Ponto ({lat:.4f},{lon:.4f}) pulado manualmente.'
-                        print(msg); lf.write(msg + '\n'); lf.flush()
-                        break
-
+                backoff = min(5 * retry, 60)
+                print(f'  [!] Tentativa {retry} falhou — retentando em {backoff}s... [s + Enter para pular]')
+                skipped = await _interruptible_sleep(backoff)
                 if skipped:
-                    line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) PULADO'
-                    pf.write(json.dumps({
-                        'index': i, 'lat': lat, 'lon': lon,
-                        'count': 0, 'total': total_new, 'names': [],
-                        'error': True, 'skipped': True,
-                    }, ensure_ascii=False) + '\n')
-                    pf.flush()
+                    print(f'  [->] Ponto ({lat:.4f},{lon:.4f}) pulado manualmente.')
+                    break
 
-                else:
-                    new_here = filter_new(all_here, seen_ids)
-                    total_new += len(new_here)
+            if skipped:
+                line = f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) PULADO'
+            else:
+                new_here = filter_new(all_here, seen_ids)
+                total_new += len(new_here)
 
-                    for m in new_here:
-                        mf.write(json.dumps({**m, 'lat': lat, 'lon': lon},
-                                            ensure_ascii=False) + '\n')
-                    mf.flush()
+                line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
+                        f'novos={len(new_here)} total={total_new}')
+                if new_here:
+                    preview = ', '.join(m['name'] for m in new_here[:3])
+                    extra   = f' (+{len(new_here)-3})' if len(new_here) > 3 else ''
+                    line   += f'\n  -> {preview}{extra}'
 
-                    pf.write(json.dumps({
-                        'index': i, 'lat': lat, 'lon': lon,
-                        'count': len(all_here), 'total': total_new,
-                        'names': [m['name'] for m in all_here[:10]],
-                        'error': False,
-                    }, ensure_ascii=False) + '\n')
-                    pf.flush()
-
-                    line = (f'[{i:4d}/{len(points)}] ({lat:.4f},{lon:.4f}) '
-                            f'novos={len(new_here)} total={total_new}')
-                    if new_here:
-                        preview = ', '.join(m['name'] for m in new_here[:3])
-                        extra   = f' (+{len(new_here)-3})' if len(new_here) > 3 else ''
-                        line   += f'\n  -> {preview}{extra}'
-
-                print(line); lf.write(line + '\n'); lf.flush()
-                await asyncio.sleep(delay * random.uniform(0.8, 1.2))
-
-            lf.write(f'\nFim: {datetime.now()}\nTotal merchants unicos: {total_new}\n')
+            print(line)
+            await asyncio.sleep(delay * random.uniform(0.8, 1.2))
 
     print(f'\n[+] Concluido. Merchants unicos: {total_new}')
-    print(f'[+] Merchants: {merchants_path}')
-    print(f'[+] Log:       {log_path}')
 
 
 if __name__ == '__main__':
@@ -977,7 +969,7 @@ if __name__ == '__main__':
     parser.add_argument('--proxy',       default=None,
                         help='Proxy HTTP/SOCKS5 (ex: http://user:pass@host:port)')
     parser.add_argument('--resume',      type=Path,  default=None, metavar='DIR',
-                        help='Retoma uma captura anterior a partir do diretório informado')
+                        help='Retoma captura anterior (lê estado local, envia novos ao Tinybird)')
     args = parser.parse_args()
 
     if args.list_cities:
@@ -995,7 +987,7 @@ if __name__ == '__main__':
             print(f'[!] Diretório não encontrado: {args.resume}')
             sys.exit(1)
         uc.loop().run_until_complete(main(
-            city='', step_km=None, delay=2.0, headless=args.headless,
+            city='', step_km=None, delay=args.delay, headless=args.headless,
             proxy=args.proxy, resume_dir=args.resume,
         ))
     else:
