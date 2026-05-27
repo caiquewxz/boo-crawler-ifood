@@ -73,6 +73,7 @@ Parâmetros:
 | `--page-size` | `100` | Restaurantes por request |
 | `--boundary` | off | Filtrar grade pelo polígono real do município via OSM |
 | `--proxy` | — | Proxy HTTP/SOCKS5 |
+| `--resume` | — | Retoma captura anterior (lê estado local, envia novos ao Tinybird) |
 
 Exemplos:
 
@@ -142,41 +143,33 @@ Parâmetros:
 
 ## Saída
 
-### `crawl_api.py` → `captures/crawl_api_CIDADE_TIMESTAMP/`
+### `crawl_api.py` → Tinybird (`ifood_events`)
 
-#### `merchants.jsonl`
+Todos os requests e responses são enviados em tempo real para o datasource `ifood_events` no Tinybird. Nenhum arquivo é salvo localmente.
 
-Um restaurante por linha, deduplicado por UUID.
+Cada request para `bm/home` (primeira página e páginas adicionais) gera um evento:
 
 ```json
-{"id": "11ff40c8-b204-45d4-a74a-1a13f42f9982", "name": "Julios Sushi", "link": "https://www.ifood.com.br/delivery/caieiras-sp/julios-sushi-laranjeiras", "category": "Japonesa", "rating": 4.8, "distance_km": 1.2, "delivery_fee": 599, "delivery_min_min": 30, "delivery_max_min": 45, "lat": -23.357, "lon": -46.826}
+{
+  "event_type": "api_request",
+  "device_id": "browser",
+  "event_data": "{\"request_url\":\"...\",\"request_method\":\"POST\",\"request_body\":\"...\",\"request_headers\":{...},\"response_status_code\":200,\"response_headers\":{...},\"response_body\":\"...\"}"
+}
 ```
 
-| Campo | Descrição |
-|-------|-----------|
-| `id` | UUID único do restaurante |
-| `name` | Nome |
-| `link` | URL direta no iFood |
-| `category` | Categoria principal |
-| `rating` | Nota de 0 a 5 |
-| `delivery_fee` | Taxa de entrega em centavos |
-| `delivery_min_min` / `delivery_max_min` | Janela de entrega estimada (minutos) |
-| `lat` / `lon` | Coordenada do ponto da grade onde foi encontrado |
+| Campo de `event_data` | Descrição |
+|-----------------------|-----------|
+| `request_url` | URL completa do request (com lat/lon/size) |
+| `request_method` | `POST` ou `GET` |
+| `request_body` | Corpo do request (string vazia se GET) |
+| `request_headers` | Headers enviados (auth, cookies PX, etc.) |
+| `response_status_code` | HTTP status (200, 401, 403, etc.) |
+| `response_headers` | Headers da resposta |
+| `response_body` | Corpo da resposta (JSON como string) |
 
-#### `points.jsonl`
+Eventos são enviados tanto em caso de **sucesso** (200) quanto de **erro** (4xx, 5xx) — a cada tentativa.
 
-Um JSON por linha com resultado de cada ponto da grade (contagem, merchants encontrados, erro).
-
-#### `crawl.log`
-
-Log de progresso:
-
-```
-[  1/36] (-21.0700,-44.3400) novos=73  total=73
-  -> Burguer King, McDonald's, Subway... (+70)
-[  2/36] (-21.0700,-44.3179) novos=18  total=91
-  -> Pizza Hut, Domino's... (+16)
-```
+O `--resume` ainda lê o estado dos arquivos locais de capturas anteriores para retomar de onde parou, mas os novos dados vão apenas ao Tinybird.
 
 ---
 

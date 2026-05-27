@@ -447,6 +447,42 @@ Observação: `_px3` não apareceu na sessão capturada (apenas `_pxhd` e `_pxvi
 
 ---
 
+## Tentativa 17 — Streaming em tempo real para Tinybird (2026-05-27)
+
+**Contexto:** Os dados do crawl eram salvos localmente em `merchants.jsonl`, `points.jsonl`
+e `crawl.log`. A equipe precisa acompanhar os dados em tempo real sem depender de arquivos locais.
+
+**O que foi feito:**
+
+Integração direta com a API de eventos do Tinybird dentro do `crawl_api.py`:
+
+- `_tb_send(client, events)` — envia NDJSON para `ifood_events`, silencia erros para
+  não travar o crawl
+- `_tb_api_request(...)` — monta o evento no schema exigido: `event_type="api_request"`,
+  `device_id="browser"`, `event_data` como JSON string com todos os campos HTTP
+- `fetch_point()` recebe parâmetro opcional `tb: httpx.AsyncClient` e chama `_tb_send`
+  **após** o request mas **antes** do check de status — garante que erros 401/403 também
+  são registrados
+- `fetch_all_pages()` propaga `tb` para `fetch_point` e também registra cada request
+  de paginação (`NEXT_CONTENT`)
+- Dois `httpx.AsyncClient` em paralelo: um para o iFood (com retries/timeout de 20s),
+  outro para o Tinybird (timeout de 15s)
+
+**Decisão de design:** Enviar dentro de `fetch_point`/`fetch_all_pages` em vez de no
+`main()` garante que **todas** as requisições são capturadas — incluindo as de paginação
+e as que falham antes de chegar no loop externo.
+
+**`--resume` preservado:** Ainda lê `points.jsonl` e `merchants.jsonl` de capturas locais
+anteriores para deduplicate e retomar de onde parou. Novos dados vão apenas ao Tinybird.
+
+**Status:**
+- ✅ Eventos enviados em tempo real a cada request (sucesso e erro)
+- ✅ Campos completos: URL, método, body, headers, status, response body
+- ✅ Paginação também capturada
+- ✅ `--resume` funcional para capturas locais existentes
+
+---
+
 ## Lições aprendidas
 
 1. **Fingerprint JS ≠ detecção comportamental.** Passar 100% no sannysoft não garante passar pelo Akamai — o Bot Manager tem camadas: fingerprint, TLS, comportamento, reputação de IP

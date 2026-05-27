@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased] — 2026-05-27
+
+### `scripts/crawl_api.py` — streaming em tempo real para Tinybird
+
+Substituídas as gravações locais (`merchants.jsonl`, `points.jsonl`, `crawl.log`) por
+envio em tempo real de eventos HTTP para o datasource `ifood_events` no Tinybird.
+
+**O que mudou:**
+
+- Removidas funções `_save_meta` e `_load_resume_state` (escrita local)
+- Removidas abertura de arquivos JSONL no loop principal
+- Adicionadas funções `_tb_send`, `_tb_api_request` para envio ao Tinybird via NDJSON
+- `fetch_point()` agora aceita parâmetro `tb` — envia evento `api_request` após cada
+  request ao iFood, independente do status (sucesso ou erro)
+- `fetch_all_pages()` propaga `tb` para `fetch_point` e também envia evento em cada
+  request de página adicional (cursor `NEXT_CONTENT`)
+- Formato do evento segue o schema `ifood_events`:
+  `event_type`, `device_id`, `event_data` (JSON string com campos completos de
+  request e response)
+- `--resume` mantido: lê `points.jsonl` e `merchants.jsonl` de capturas locais
+  anteriores para retomar de onde parou, mas novos dados vão apenas ao Tinybird
+
+---
+
 ## [Unreleased] — 2026-05-25
 
 ### Problema corrigido: 73 → ~400 restaurantes por ponto de grade
